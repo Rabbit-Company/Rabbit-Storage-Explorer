@@ -1,0 +1,57 @@
+[package]
+name = "rabbit-storage-explorer"
+version = "1.0.0"
+edition = "2021"
+rust-version = "1.85"
+description = "A GTK4 storage explorer for S3-compatible object stores, SFTP, NFS and SMB, with drag-and-drop uploads and optional end-to-end encryption"
+license = "GPL-3.0-or-later"
+
+[dependencies]
+# UI - versions verified: gtk4 0.11.x pairs with libadwaita 0.9.x
+gtk = { package = "gtk4", version = "0.11", features = ["v4_10"] }
+adw = { package = "libadwaita", version = "0.9", features = ["v1_5"] }
+
+# Async runtime
+tokio = { version = "1", features = ["rt-multi-thread", "fs", "io-util", "macros", "sync", "time"] }
+tokio-util = "0.7"
+async-channel = "2"
+async-trait = "0.1"
+
+# S3-compatible object storage
+aws-config = { version = "1", features = ["behavior-version-latest"] }
+aws-sdk-s3 = "1"
+aws-smithy-types = { version = "1", features = ["rt-tokio"] }
+
+# Crypto (E2EE)
+chacha20poly1305 = "0.10"   # content encryption (AEAD, chunked)
+aes-siv = "0.7"             # deterministic filename encryption
+argon2 = "0.5"              # password KDF (Argon2id)
+hkdf = "0.12"
+sha2 = "0.10"
+rand = "0.8"
+zeroize = { version = "1", features = ["derive"] }
+data-encoding = "2"         # base32 for encrypted filenames
+base64 = "0.22"
+
+# Persistence
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
+
+# Misc
+walkdir = "2"
+
+# SFTP (SSH)
+russh = "0.62"
+russh-sftp = "2"
+
+# NFS v3 (pure Rust)
+nfs3_client = { version = "0.9", features = ["tokio"] }
+
+# SMB 2/3 (pure Rust, pipelined I/O)
+smb2 = "0.13"
+anyhow = "1"
+
+[profile.release]
+lto = "thin"
+strip = true

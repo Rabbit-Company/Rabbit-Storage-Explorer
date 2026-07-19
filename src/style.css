@@ -1,0 +1,31 @@
+/* Rabbit Storage Explorer - small refinements on top of Adwaita */
+
+.breadcrumbs button {
+	padding: 1px 7px;
+	min-height: 0;
+	font-size: 0.92em;
+}
+
+.breadcrumbs label {
+	color: alpha(currentColor, 0.45);
+}
+
+statuspage.drop-overlay {
+	background: alpha(@accent_bg_color, 0.3);
+	border: 2px dashed @accent_bg_color;
+	border-radius: 14px;
+	margin: 14px;
+}
+
+columnview.data-table row {
+	min-height: 34px;
+}
+
+/* E2EE status on file/folder icons */
+image.icon-encrypted {
+	color: @success_color;
+}
+
+image.icon-unencrypted {
+	color: @error_color;
+}

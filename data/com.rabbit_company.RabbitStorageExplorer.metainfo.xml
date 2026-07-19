@@ -1,0 +1,71 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+	<id>com.rabbit_company.RabbitStorageExplorer</id>
+	<launchable type="desktop-id">com.rabbit_company.RabbitStorageExplorer.desktop</launchable>
+	<metadata_license>CC0-1.0</metadata_license>
+	<project_license>GPL-3.0-or-later</project_license>
+
+	<name>Rabbit Storage Explorer</name>
+
+	<categories>
+		<category>Utility</category>
+		<category>FileTools</category>
+		<category>Network</category>
+	</categories>
+
+	<branding>
+		<color type="primary" scheme_preference="light">#85A0FF</color>
+		<color type="primary" scheme_preference="dark">#2A43B8</color>
+	</branding>
+
+	<summary>Browse S3, SFTP, NFS and SMB storage</summary>
+
+	<description>
+		<p>Rabbit Storage Explorer is a fast, native file explorer for S3-compatible object storage, SFTP (SSH), NFS and SMB network shares.</p>
+		<p>Upload thousands of files at once by dragging and dropping them anywhere in the window. Transfers run in parallel with automatic retries, live progress and per-file details, and can be cancelled at any time.</p>
+		<p>Optional end-to-end encryption protects both file contents and file names: everything is encrypted on your machine before upload, so the server only ever sees ciphertext. Connection secrets are stored in the system keychain, and SSH host keys are verified on every connection.</p>
+	</description>
+
+	<developer_name>Rabbit Company</developer_name>
+
+	<releases>
+		<release version="1.0.0" date="2026-07-15">
+			<description>
+				<p>Initial release</p>
+			</description>
+		</release>
+	</releases>
+
+	<screenshots>
+		<screenshot type="default">
+			<image type="source">https://cdn.rabbit-company.com/RabbitStorageExplorer/screenshots/browser.png</image>
+			<caption>File browser</caption>
+		</screenshot>
+		<screenshot>
+			<image type="source">https://cdn.rabbit-company.com/RabbitStorageExplorer/screenshots/connections.png</image>
+			<caption>Connection manager</caption>
+		</screenshot>
+	</screenshots>
+
+	<content_rating type="oars-1.1" />
+
+	<requires>
+		<display_length compare="gt">400</display_length>
+	</requires>
+
+	<recommends>
+		<memory>1024</memory>
+		<display_length compare="ge">600</display_length>
+	</recommends>
+
+	<supports>
+		<control>pointing</control>
+		<control>keyboard</control>
+		<control>touch</control>
+	</supports>
+
+	<url type="homepage">https://rabbit-company.com</url>
+	<url type="bugtracker">https://github.com/Rabbit-Company/Rabbit-Storage-Explorer/issues</url>
+	<url type="vcs-browser">https://github.com/Rabbit-Company/Rabbit-Storage-Explorer</url>
+	<url type="contact">https://rabbit-company.com/contact</url>
+</component>

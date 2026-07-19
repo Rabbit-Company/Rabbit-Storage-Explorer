@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="128" height="128" viewBox="0 0 128 128" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#85a0ff"/>
+      <stop offset="1" stop-color="#2a43b8"/>
+    </linearGradient>
+  </defs>
+  <!-- background tile -->
+  <rect x="8" y="8" width="112" height="112" rx="26" fill="url(#bg)"/>
+  <!-- rabbit ears -->
+  <g fill="#ffffff">
+    <ellipse cx="48" cy="40" rx="9" ry="22" transform="rotate(-12 48 40)"/>
+    <ellipse cx="80" cy="40" rx="9" ry="22" transform="rotate(12 80 40)"/>
+    <ellipse cx="48" cy="42" rx="4" ry="14" transform="rotate(-12 48 42)" fill="#c7d3ff"/>
+    <ellipse cx="80" cy="42" rx="4" ry="14" transform="rotate(12 80 42)" fill="#c7d3ff"/>
+  </g>
+  <!-- storage bucket -->
+  <path d="M36 58 h56 a4 4 0 0 1 4 6 l-8 34 a8 8 0 0 1 -8 6 H48 a8 8 0 0 1 -8 -6 l-8 -34 a4 4 0 0 1 4 -6 z" fill="#ffffff"/>
+  <ellipse cx="64" cy="60" rx="30" ry="7" fill="#e2e8ff"/>
+  <!-- upload arrow -->
+  <path d="M64 92 v-18 m0 0 l-9 9 m9 -9 l9 9" stroke="#2a43b8" stroke-width="7" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+</svg>
