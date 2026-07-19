@@ -84,8 +84,20 @@ impl BrowserPage {
 		toolbar.set_margin_top(6);
 		toolbar.set_margin_bottom(6);
 
-		let btn_upload = icon_button("document-send-symbolic", "Upload files...");
-		let btn_upload_dir = icon_button("folder-symbolic", "Upload folders...");
+		let btn_upload = gtk::MenuButton::new();
+		btn_upload.set_icon_name("document-send-symbolic");
+		btn_upload.set_tooltip_text(Some("Upload"));
+		btn_upload.add_css_class("flat");
+
+		let mi_files = menu_row("document-send-symbolic", "Files…");
+		let mi_folders = menu_row("folder-symbolic", "Folders…");
+		let upload_menu = gtk::Box::new(gtk::Orientation::Vertical, 0);
+		upload_menu.append(&mi_files);
+		upload_menu.append(&mi_folders);
+		let upload_popover = gtk::Popover::new();
+		upload_popover.set_child(Some(&upload_menu));
+		btn_upload.set_popover(Some(&upload_popover));
+
 		let btn_new_folder = icon_button("folder-new-symbolic", "New folder");
 		let btn_download = icon_button("folder-download-symbolic", "Download selected");
 		let btn_delete = icon_button("user-trash-symbolic", "Delete selected");
@@ -94,14 +106,8 @@ impl BrowserPage {
 		search.set_placeholder_text(Some("Filter by name"));
 		search.set_hexpand(true);
 
-		for b in [
-			&btn_upload,
-			&btn_upload_dir,
-			&btn_new_folder,
-			&btn_download,
-			&btn_delete,
-			&btn_refresh,
-		] {
+		toolbar.append(&btn_upload);
+		for b in [&btn_new_folder, &btn_download, &btn_delete, &btn_refresh] {
 			toolbar.append(b);
 		}
 		toolbar.append(&search);
@@ -115,7 +121,10 @@ impl BrowserPage {
 		view.set_vexpand(true);
 		view.add_css_class("data-table");
 
-		let name_col = name_column();
+		let ctx_page: Rc<RefCell<std::rc::Weak<BrowserPage>>> =
+			Rc::new(RefCell::new(std::rc::Weak::new()));
+
+		let name_col = name_column(ctx_page.clone());
 		name_col.set_sorter(Some(&entry_sorter(|a, b| {
 			a.name.to_lowercase().cmp(&b.name.to_lowercase())
 		})));
@@ -238,6 +247,8 @@ impl BrowserPage {
 			stats_widgets: RefCell::new(None),
 		});
 
+		*ctx_page.borrow_mut() = Rc::downgrade(&page);
+
 		// Row activation (double-click / Enter): enter folders.
 		let p = page.clone();
 		view.connect_activate(move |_, pos| {
@@ -253,11 +264,19 @@ impl BrowserPage {
 		});
 
 		let p = page.clone();
+		let pop = upload_popover.clone();
+		mi_files.connect_clicked(move |_| {
+			pop.popdown();
+			p.pick_files_and_upload();
+		});
+		let p = page.clone();
+		let pop = upload_popover.clone();
+		mi_folders.connect_clicked(move |_| {
+			pop.popdown();
+			p.pick_folders_and_upload();
+		});
+		let p = page.clone();
 		btn_refresh.connect_clicked(move |_| p.request_list());
-		let p = page.clone();
-		btn_upload.connect_clicked(move |_| p.pick_files_and_upload());
-		let p = page.clone();
-		btn_upload_dir.connect_clicked(move |_| p.pick_folders_and_upload());
 		let p = page.clone();
 		btn_new_folder.connect_clicked(move |_| p.new_folder_dialog());
 		let p = page.clone();
@@ -532,7 +551,10 @@ impl BrowserPage {
 	}
 
 	fn download_selected(&self) {
-		let items = self.selected();
+		self.download_items(self.selected());
+	}
+
+	fn download_items(&self, items: Vec<RemoteEntry>) {
 		if items.is_empty() {
 			return;
 		}
@@ -557,7 +579,10 @@ impl BrowserPage {
 	}
 
 	fn confirm_delete_selected(&self) {
-		let items = self.selected();
+		self.confirm_delete_items(self.selected());
+	}
+
+	fn confirm_delete_items(&self, items: Vec<RemoteEntry>) {
 		if items.is_empty() {
 			return;
 		}
@@ -584,6 +609,40 @@ impl BrowserPage {
 			});
 		});
 		dialog.present(Some(&window));
+	}
+
+	fn show_row_menu(&self, entry: RemoteEntry, anchor: &impl IsA<gtk::Widget>, x: f64, y: f64) {
+		let btn_dl = menu_row("folder-download-symbolic", "Download");
+		let btn_del = menu_row("user-trash-symbolic", "Delete");
+		let menu = gtk::Box::new(gtk::Orientation::Vertical, 0);
+		menu.append(&btn_dl);
+		menu.append(&btn_del);
+
+		let popover = gtk::Popover::new();
+		popover.set_child(Some(&menu));
+		popover.set_parent(anchor);
+		popover.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+		popover.connect_closed(|pop| pop.unparent());
+
+		let p = self.weak_self.clone();
+		let e = entry.clone();
+		let pop = popover.clone();
+		btn_dl.connect_clicked(move |_| {
+			pop.popdown();
+			if let Some(p) = p.upgrade() {
+				p.download_items(vec![e.clone()]);
+			}
+		});
+		let p = self.weak_self.clone();
+		let pop = popover.clone();
+		btn_del.connect_clicked(move |_| {
+			pop.popdown();
+			if let Some(p) = p.upgrade() {
+				p.confirm_delete_items(vec![entry.clone()]);
+			}
+		});
+
+		popover.popup();
 	}
 
 	pub fn transfer_started(&self, total_files: u64, total_bytes: u64, files: Vec<FileProgress>) {
@@ -901,6 +960,20 @@ fn entry_sorter(
 	})
 }
 
+/// A flat button with a left-aligned icon + label, for use inside popovers.
+fn menu_row(icon: &str, label: &str) -> gtk::Button {
+	let content = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+	content.append(&gtk::Image::from_icon_name(icon));
+	let l = gtk::Label::new(Some(label));
+	l.set_xalign(0.0);
+	l.set_hexpand(true);
+	content.append(&l);
+	let b = gtk::Button::new();
+	b.set_child(Some(&content));
+	b.add_css_class("flat");
+	b
+}
+
 fn icon_button(icon: &str, tooltip: &str) -> gtk::Button {
 	let b = gtk::Button::from_icon_name(icon);
 	b.set_tooltip_text(Some(tooltip));
@@ -908,9 +981,9 @@ fn icon_button(icon: &str, tooltip: &str) -> gtk::Button {
 	b
 }
 
-fn name_column() -> gtk::ColumnViewColumn {
+fn name_column(ctx: Rc<RefCell<std::rc::Weak<BrowserPage>>>) -> gtk::ColumnViewColumn {
 	let factory = gtk::SignalListItemFactory::new();
-	factory.connect_setup(|_, item| {
+	factory.connect_setup(move |_, item| {
 		let item = item.downcast_ref::<gtk::ListItem>().unwrap();
 		let hbox = gtk::Box::new(gtk::Orientation::Horizontal, 8);
 		let icon = gtk::Image::new();
@@ -919,6 +992,28 @@ fn name_column() -> gtk::ColumnViewColumn {
 		label.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
 		hbox.append(&icon);
 		hbox.append(&label);
+
+		// Right-click anywhere on the name cell opens the row menu.
+		let gesture = gtk::GestureClick::new();
+		gesture.set_button(gdk::BUTTON_SECONDARY);
+		let ctx = ctx.clone();
+		let item_weak = item.downgrade();
+		let hbox_weak = hbox.downgrade();
+		gesture.connect_pressed(move |g, _, x, y| {
+			g.set_state(gtk::EventSequenceState::Claimed);
+			let (Some(item), Some(hbox)) = (item_weak.upgrade(), hbox_weak.upgrade()) else {
+				return;
+			};
+			let Some(obj) = item.item().and_downcast::<glib::BoxedAnyObject>() else {
+				return;
+			};
+			let entry = obj.borrow::<RemoteEntry>().clone();
+			if let Some(page) = ctx.borrow().upgrade() {
+				page.show_row_menu(entry, &hbox, x, y);
+			}
+		});
+		hbox.add_controller(gesture);
+
 		item.set_child(Some(&hbox));
 	});
 	factory.connect_bind(|_, item| {
