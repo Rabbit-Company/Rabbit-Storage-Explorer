@@ -110,7 +110,9 @@ impl ConnectionPage {
 
 		let form_title = gtk::Label::new(Some("Add connection"));
 		form_title.add_css_class("title-1");
-		let form_desc = gtk::Label::new(Some("S3-compatible object storage or an SSH server (SFTP)"));
+		let form_desc = gtk::Label::new(Some(
+			"S3-compatible object storage, NFS, SMB or an SSH server (SFTP)",
+		));
 		form_desc.add_css_class("dim-label");
 		let form_header = gtk::Box::new(gtk::Orientation::Vertical, 6);
 		form_header.set_margin_top(24);
