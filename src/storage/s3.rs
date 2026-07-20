@@ -15,6 +15,22 @@ pub struct S3Backend {
 	bucket: String,
 }
 
+/// AWS requires the CopyObject source (`bucket/key`) to be URL-encoded.
+fn encode_copy_source(bucket: &str, key: &str) -> String {
+	let mut out = String::with_capacity(bucket.len() + 1 + key.len());
+	out.push_str(bucket);
+	out.push('/');
+	for b in key.bytes() {
+		match b {
+			b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
+				out.push(b as char)
+			}
+			_ => out.push_str(&format!("%{b:02X}")),
+		}
+	}
+	out
+}
+
 impl S3Backend {
 	pub async fn connect(
 		endpoint: &str,
@@ -114,6 +130,19 @@ impl S3Backend {
 			}
 		}
 		Ok(out)
+	}
+
+	async fn copy_one(&self, from: &str, to: &str) -> Result<()> {
+		self
+			.client
+			.copy_object()
+			.bucket(&self.bucket)
+			.copy_source(encode_copy_source(&self.bucket, from))
+			.key(to)
+			.send()
+			.await
+			.with_context(|| format!("copy failed: {from} -> {to}"))?;
+		Ok(())
 	}
 }
 
@@ -288,6 +317,28 @@ impl StorageBackend for S3Backend {
 				.send()
 				.await
 				.context("delete failed")?;
+		}
+		Ok(())
+	}
+
+	async fn rename(&self, from: &str, to: &str) -> Result<()> {
+		if from.ends_with('/') {
+			// Directory: copy every object under `from` to the swapped prefix,
+			// plus the folder marker itself, then delete all the originals.
+			let mut old_keys = Vec::new();
+			for o in self.list_recursive(from).await? {
+				let suffix = o.key.strip_prefix(from).unwrap_or(&o.key);
+				self.copy_one(&o.key, &format!("{to}{suffix}")).await?;
+				old_keys.push(o.key);
+			}
+			if self.get(from).await?.is_some() {
+				self.copy_one(from, to).await?; // preserve an explicit empty-folder marker
+			}
+			old_keys.push(from.to_string());
+			self.delete(old_keys).await?;
+		} else {
+			self.copy_one(from, to).await?;
+			self.delete(vec![from.to_string()]).await?;
 		}
 		Ok(())
 	}

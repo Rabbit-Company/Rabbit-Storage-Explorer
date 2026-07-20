@@ -158,6 +158,10 @@ pub fn build(app: &adw::Application) {
 						toast(&format!("Deleted {count} object(s)"));
 						browser.request_list();
 					}
+					Event::Moved { count } => {
+						toast(&format!("Moved {count} item(s)"));
+						browser.request_list();
+					}
 					Event::Toast(msg) => toast(&msg),
 				}
 			}

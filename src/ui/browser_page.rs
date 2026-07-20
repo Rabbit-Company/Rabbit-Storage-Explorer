@@ -430,6 +430,22 @@ impl BrowserPage {
 					p.request_list();
 				}
 			});
+
+			let real_prefix = self.path.borrow()[i].1.clone();
+			let drop = gtk::DropTarget::new(String::static_type(), gdk::DragAction::MOVE);
+			let weak = self.weak_self.clone();
+			drop.connect_drop(move |_, value, _, _| {
+				let Ok(key) = value.get::<String>() else {
+					return false;
+				};
+				if let Some(p) = weak.upgrade() {
+					p.perform_move(&key, real_prefix.clone());
+					return true;
+				}
+				false
+			});
+			btn.add_controller(drop);
+
 			self.breadcrumbs.append(&btn);
 		}
 	}
@@ -643,6 +659,30 @@ impl BrowserPage {
 		});
 
 		popover.popup();
+	}
+
+	fn entry_by_key(&self, key: &str) -> Option<RemoteEntry> {
+		self.entries.borrow().iter().find(|e| e.key == key).cloned()
+	}
+
+	/// Move the dragged row (or the whole selection, if the dragged row is part
+	/// of a multi-selection) into `dest_prefix`.
+	fn perform_move(&self, dragged_key: &str, dest_prefix: String) {
+		let sel = self.selected();
+		let mut items = if sel.len() > 1 && sel.iter().any(|e| e.key == dragged_key) {
+			sel
+		} else if let Some(e) = self.entry_by_key(dragged_key) {
+			vec![e]
+		} else {
+			return;
+		};
+		// Never move the destination folder into itself.
+		let dest = dest_prefix.trim_end_matches('/').to_string();
+		items.retain(|e| e.key.trim_end_matches('/') != dest);
+		if items.is_empty() {
+			return;
+		}
+		let _ = self.cmd.send_blocking(Command::Move { items, dest_prefix });
 	}
 
 	pub fn transfer_started(&self, total_files: u64, total_bytes: u64, files: Vec<FileProgress>) {
@@ -993,26 +1033,93 @@ fn name_column(ctx: Rc<RefCell<std::rc::Weak<BrowserPage>>>) -> gtk::ColumnViewC
 		hbox.append(&icon);
 		hbox.append(&label);
 
-		// Right-click anywhere on the name cell opens the row menu.
+		// Right-click context menu.
 		let gesture = gtk::GestureClick::new();
 		gesture.set_button(gdk::BUTTON_SECONDARY);
-		let ctx = ctx.clone();
-		let item_weak = item.downgrade();
-		let hbox_weak = hbox.downgrade();
+		let ctx_menu = ctx.clone();
+		let item_menu = item.downgrade();
+		let hbox_menu = hbox.downgrade();
 		gesture.connect_pressed(move |g, _, x, y| {
 			g.set_state(gtk::EventSequenceState::Claimed);
-			let (Some(item), Some(hbox)) = (item_weak.upgrade(), hbox_weak.upgrade()) else {
+			let (Some(item), Some(hbox)) = (item_menu.upgrade(), hbox_menu.upgrade()) else {
 				return;
 			};
 			let Some(obj) = item.item().and_downcast::<glib::BoxedAnyObject>() else {
 				return;
 			};
 			let entry = obj.borrow::<RemoteEntry>().clone();
-			if let Some(page) = ctx.borrow().upgrade() {
+			if let Some(page) = ctx_menu.borrow().upgrade() {
 				page.show_row_menu(entry, &hbox, x, y);
 			}
 		});
 		hbox.add_controller(gesture);
+
+		// Drag source: carries the dragged row's real key.
+		let drag = gtk::DragSource::new();
+		drag.set_actions(gdk::DragAction::MOVE);
+		let item_drag = item.downgrade();
+		drag.connect_prepare(move |_, _, _| {
+			let item = item_drag.upgrade()?;
+			let obj = item.item().and_downcast::<glib::BoxedAnyObject>()?;
+			let key = obj.borrow::<RemoteEntry>().key.clone();
+			Some(gdk::ContentProvider::for_value(&key.to_value()))
+		});
+		let hbox_icon = hbox.downgrade();
+		drag.connect_drag_begin(move |src, _| {
+			if let Some(h) = hbox_icon.upgrade() {
+				let paintable = gtk::WidgetPaintable::new(Some(&h));
+				src.set_icon(Some(&paintable), 0, 0);
+			}
+		});
+		hbox.add_controller(drag);
+
+		// Drop target: only folders accept, and only internal key payloads.
+		let drop = gtk::DropTarget::new(String::static_type(), gdk::DragAction::MOVE);
+		let item_accept = item.downgrade();
+		drop.connect_accept(move |_, _| {
+			item_accept
+				.upgrade()
+				.and_then(|i| i.item().and_downcast::<glib::BoxedAnyObject>())
+				.map(|o| o.borrow::<RemoteEntry>().is_dir)
+				.unwrap_or(false)
+		});
+		let hbox_enter = hbox.downgrade();
+		drop.connect_enter(move |_, _, _| {
+			if let Some(h) = hbox_enter.upgrade() {
+				h.add_css_class("drop-into");
+			}
+			gdk::DragAction::MOVE
+		});
+		let hbox_leave = hbox.downgrade();
+		drop.connect_leave(move |_| {
+			if let Some(h) = hbox_leave.upgrade() {
+				h.remove_css_class("drop-into");
+			}
+		});
+		let ctx_drop = ctx.clone();
+		let item_drop = item.downgrade();
+		let hbox_drop = hbox.downgrade();
+		drop.connect_drop(move |_, value, _, _| {
+			if let Some(h) = hbox_drop.upgrade() {
+				h.remove_css_class("drop-into");
+			}
+			let Ok(key) = value.get::<String>() else {
+				return false;
+			};
+			let (Some(item), Some(page)) = (item_drop.upgrade(), ctx_drop.borrow().upgrade()) else {
+				return false;
+			};
+			let Some(obj) = item.item().and_downcast::<glib::BoxedAnyObject>() else {
+				return false;
+			};
+			let dest = obj.borrow::<RemoteEntry>();
+			if !dest.is_dir || dest.key == key {
+				return false;
+			}
+			page.perform_move(&key, dest.key.clone());
+			true
+		});
+		hbox.add_controller(drop);
 
 		item.set_child(Some(&hbox));
 	});
@@ -1036,7 +1143,6 @@ fn name_column(ctx: Rc<RefCell<std::rc::Weak<BrowserPage>>>) -> gtk::ColumnViewC
 		} else {
 			"text-x-generic-symbolic"
 		}));
-		// Cells are recycled: reset status classes before applying the new one.
 		icon.remove_css_class("icon-encrypted");
 		icon.remove_css_class("icon-unencrypted");
 		match entry.encrypted {

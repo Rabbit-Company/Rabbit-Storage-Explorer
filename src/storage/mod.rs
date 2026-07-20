@@ -129,4 +129,31 @@ pub trait StorageBackend: Send + Sync {
 
 	/// Delete up to 1000 keys per call is handled internally; any number accepted.
 	async fn delete(&self, keys: Vec<String>) -> Result<()>;
+
+	/// Move/rename one object or an entire subtree (a trailing `/` on both
+	/// `from` and `to` denotes a directory). Real keys, not display names.
+	///
+	/// Default: server-agnostic copy-then-delete. Backends with a native,
+	/// server-side rename should override this for an instant move.
+	async fn rename(&self, from: &str, to: &str) -> Result<()> {
+		if from.ends_with('/') {
+			// Make sure the destination directory exists even if it's empty.
+			self.prepare_parents(&format!("{to}x")).await?;
+			for o in self.list_recursive(from).await? {
+				let suffix = o.key.strip_prefix(from).unwrap_or(&o.key);
+				let new_key = format!("{to}{suffix}");
+				if let Some(data) = self.get(&o.key).await? {
+					self.prepare_parents(&new_key).await?;
+					self.put(&new_key, data).await?;
+				}
+			}
+		} else if let Some(data) = self.get(from).await? {
+			self.prepare_parents(to).await?;
+			self.put(to, data).await?;
+		}
+		// Remove the source. For a trailing-slash key the filesystem backends'
+		// `delete` walks and removes the whole subtree (including now-empty dirs).
+		self.delete(vec![from.to_string()]).await?;
+		Ok(())
+	}
 }

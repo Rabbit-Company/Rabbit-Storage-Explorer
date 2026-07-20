@@ -29,3 +29,8 @@ image.icon-encrypted {
 image.icon-unencrypted {
 	color: @error_color;
 }
+
+box.drop-into {
+	background: alpha(@accent_bg_color, 0.25);
+	border-radius: 6px;
+}

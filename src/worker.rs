@@ -48,6 +48,10 @@ pub enum Command {
 	Delete {
 		items: Vec<RemoteEntry>,
 	},
+	Move {
+		items: Vec<RemoteEntry>,
+		dest_prefix: String,
+	},
 	CancelTransfers,
 	SetSettings(Settings),
 }
@@ -104,6 +108,9 @@ pub enum Event {
 		errors: Vec<String>,
 	},
 	Deleted {
+		count: u64,
+	},
+	Moved {
 		count: u64,
 	},
 	FolderCreated,
@@ -334,6 +341,26 @@ async fn dispatch(cmd_rx: async_channel::Receiver<Command>, ev: async_channel::S
 						}
 						Err(e) => {
 							let _ = ev.send(Event::Toast(format!("Delete failed: {e:#}"))).await;
+						}
+					}
+				});
+			}
+
+			Command::Move { items, dest_prefix } => {
+				let Some(s) = session.clone() else { continue };
+				let ev = ev.clone();
+				tokio::spawn(async move {
+					let mut result = run_move(&s, items.clone(), &dest_prefix).await;
+					if result.is_err() {
+						s.wait_until_healthy(&CancellationToken::new()).await;
+						result = run_move(&s, items, &dest_prefix).await;
+					}
+					match result {
+						Ok(n) => {
+							let _ = ev.send(Event::Moved { count: n }).await;
+						}
+						Err(e) => {
+							let _ = ev.send(Event::Toast(format!("Move failed: {e:#}"))).await;
 						}
 					}
 				});
@@ -1068,4 +1095,36 @@ async fn run_delete(s: &Session, items: Vec<RemoteEntry>) -> Result<u64> {
 	let n = keys.len() as u64;
 	s.backend().await.delete(keys).await?;
 	Ok(n)
+}
+
+async fn run_move(s: &Session, items: Vec<RemoteEntry>, dest_prefix: &str) -> Result<u64> {
+	let backend = s.backend().await;
+	let mut moved = 0u64;
+	for item in items {
+		// The item keeps its own (encrypted) leaf segment; only the parent
+		// prefix changes, so we never touch names or file contents.
+		let trimmed = item.key.trim_end_matches('/');
+		let leaf = trimmed.rsplit('/').next().unwrap_or(trimmed);
+		if item.is_dir {
+			let from = if item.key.ends_with('/') {
+				item.key.clone()
+			} else {
+				format!("{}/", item.key)
+			};
+			let to = format!("{dest_prefix}{leaf}/");
+			// Same place, or moving a folder into itself/a descendant: skip.
+			if to == from || dest_prefix.starts_with(&from) {
+				continue;
+			}
+			backend.rename(&from, &to).await?;
+		} else {
+			let to = format!("{dest_prefix}{leaf}");
+			if to == item.key {
+				continue;
+			}
+			backend.rename(&item.key, &to).await?;
+		}
+		moved += 1;
+	}
+	Ok(moved)
 }
