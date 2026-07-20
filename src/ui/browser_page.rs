@@ -283,6 +283,17 @@ impl BrowserPage {
 		btn_download.connect_clicked(move |_| p.download_selected());
 		let p = page.clone();
 		btn_delete.connect_clicked(move |_| p.confirm_delete_selected());
+		let key = gtk::EventControllerKey::new();
+		let p = page.clone();
+		key.connect_key_pressed(move |_, keyval, _, _| {
+			if keyval == gdk::Key::Delete || keyval == gdk::Key::KP_Delete {
+				p.confirm_delete_selected();
+				glib::Propagation::Stop
+			} else {
+				glib::Propagation::Proceed
+			}
+		});
+		view.add_controller(key);
 		let p = page.clone();
 		btn_cancel.connect_clicked(move |_| {
 			let _ = p.cmd.send_blocking(Command::CancelTransfers);
