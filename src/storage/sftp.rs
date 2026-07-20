@@ -11,13 +11,14 @@
 //! (the stored secret is then used as the key passphrase).
 
 use super::{MultipartUpload, RawObject, Reader, StorageBackend};
+use crate::crypto;
 use crate::settings::{self, ConnectionProfile};
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
 use russh::keys::{load_secret_key, PrivateKeyWithHashAlg};
 use russh_sftp::client::error::Error as SftpError;
 use russh_sftp::client::SftpSession;
-use russh_sftp::protocol::{OpenFlags, StatusCode};
+use russh_sftp::protocol::{FileAttributes, OpenFlags, StatusCode};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
@@ -25,6 +26,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
+
+/// Shared vault location for SSH accounts that have no home directory.
+/// `/var/lib` is the FHS place for persistent state (unlike `/var/tmp`,
+/// which tmpfiles cleaners may purge). The directory itself must
+/// be creatable by connecting users or pre-created by an administrator:
+/// `mkdir -m 1777 /var/lib/rabbit-storage-explorer`.
+const GLOBAL_VAULT_DIR: &str = "/var/lib/rabbit-storage-explorer";
 
 struct HostKeyRecorder {
 	observed: Arc<StdMutex<Option<String>>>,
@@ -51,6 +59,9 @@ pub struct SftpBackend {
 	sftp: SftpSession,
 	/// Canonicalized remote root, no trailing slash.
 	root: String,
+	/// Absolute path of this account's E2EE vault file (home-anchored, or the
+	/// global location for accounts without a home). Independent of `root`.
+	vault_path: String,
 	/// Keeps the SSH connection alive for the lifetime of the backend.
 	_session: russh::client::Handle<HostKeyRecorder>,
 	/// In-flight "multipart" uploads: id -> open remote file handle.
@@ -153,9 +164,29 @@ impl SftpBackend {
 			trimmed => trimmed.to_string(),
 		};
 
+		// E2EE vault anchor: per *account*, not per browse root, so changing
+		// the remote directory later still opens the same vault. "." resolves
+		// against the session's initial directory, i.e. the SSH user's home
+		// (/home/ziga, /Users/ziga, ...). Accounts without a home directory
+		// are dropped into "/" by sshd and use the shared global location.
+		let home = sftp
+			.canonicalize(".")
+			.await
+			.map(|h| match h.trim_end_matches('/') {
+				"" => "/".to_string(),
+				trimmed => trimmed.to_string(),
+			})
+			.unwrap_or_else(|_| "/".to_string());
+		let vault_path = if home == "/" {
+			format!("{GLOBAL_VAULT_DIR}/{}", crypto::VAULT_KEY)
+		} else {
+			format!("{home}/{}", crypto::VAULT_KEY)
+		};
+
 		Ok(Self {
 			sftp,
 			root,
+			vault_path,
 			_session: session,
 			uploads: Mutex::new(HashMap::new()),
 			upload_seq: AtomicU64::new(0),
@@ -465,5 +496,86 @@ impl StorageBackend for SftpBackend {
 			}
 		}
 		Ok(())
+	}
+
+	async fn get_vault(&self) -> Result<Option<Vec<u8>>> {
+		with_timeout(60, async {
+			match self
+				.sftp
+				.open_with_flags(&self.vault_path, OpenFlags::READ)
+				.await
+			{
+				Ok(mut file) => {
+					let mut buf = Vec::new();
+					file
+						.read_to_end(&mut buf)
+						.await
+						.with_context(|| format!("reading vault file {}", self.vault_path))?;
+					Ok(Some(buf))
+				}
+				Err(SftpError::Status(s)) if matches!(s.status_code, StatusCode::NoSuchFile) => Ok(None),
+				Err(e) => Err(anyhow!("opening vault {} failed: {e}", self.vault_path)),
+			}
+		})
+		.await
+	}
+
+	async fn put_vault(&self, data: Vec<u8>) -> Result<()> {
+		with_timeout(120, async {
+			let global = self.vault_path.starts_with(GLOBAL_VAULT_DIR);
+			if global {
+				// Ensure the shared directory exists. Creating it under
+				// /var/lib usually needs privileges, so if both the create
+				// and a stat fail, give the admin an actionable error.
+				if self.sftp.create_dir(GLOBAL_VAULT_DIR).await.is_ok() {
+					let _ = self
+						.sftp
+						.set_metadata(
+							GLOBAL_VAULT_DIR,
+							FileAttributes {
+								permissions: Some(0o1777),
+								..Default::default()
+							},
+						)
+						.await;
+				} else {
+					self.sftp.metadata(GLOBAL_VAULT_DIR).await.map_err(|_| {
+						anyhow!(
+							"this SSH account has no home directory, and the shared vault \
+							 location {GLOBAL_VAULT_DIR} does not exist and cannot be created; \
+							 ask an administrator to run: mkdir -m 1777 {GLOBAL_VAULT_DIR}"
+						)
+					})?;
+				}
+			}
+
+			let mut file = self
+				.sftp
+				.open_with_flags(
+					&self.vault_path,
+					OpenFlags::CREATE | OpenFlags::TRUNCATE | OpenFlags::WRITE,
+				)
+				.await
+				.with_context(|| format!("creating vault file {}", self.vault_path))?;
+			file.write_all(&data).await?;
+			file.shutdown().await?;
+
+			if global {
+				// The global vault must be readable by every user. Best-effort:
+				// a server that rejects setstat leaves umask defaults in place.
+				let _ = self
+					.sftp
+					.set_metadata(
+						&self.vault_path,
+						FileAttributes {
+							permissions: Some(0o644),
+							..Default::default()
+						},
+					)
+					.await;
+			}
+			Ok(())
+		})
+		.await
 	}
 }

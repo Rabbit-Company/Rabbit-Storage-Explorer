@@ -383,12 +383,10 @@ async fn connect(
 			.ok_or_else(|| anyhow!("an encryption password is required when E2EE is enabled"))?
 			.to_string();
 
-		match backend.get(crypto::VAULT_KEY).await? {
+		match backend.get_vault().await? {
 			Some(blob) => {
 				let vault: crypto::VaultFile =
-					serde_json::from_slice(&blob).context("the bucket's vault metadata is corrupted")?;
-				// Argon2id is deliberately expensive - keep it off the runtime's
-				// async workers so other tasks aren't starved.
+					serde_json::from_slice(&blob).context("the vault metadata is corrupted")?;
 				let keys = tokio::task::spawn_blocking(move || crypto::open_vault(&vault, &password))
 					.await
 					.map_err(|e| anyhow!("{e}"))??;
@@ -400,9 +398,9 @@ async fn connect(
 					.await
 					.map_err(|e| anyhow!("{e}"))??;
 				backend
-					.put(crypto::VAULT_KEY, serde_json::to_vec(&vault)?)
+					.put_vault(serde_json::to_vec(&vault)?)
 					.await
-					.context("storing vault metadata in the bucket")?;
+					.context("storing vault metadata")?;
 				Some(Arc::new(keys))
 			}
 		}
@@ -427,7 +425,7 @@ async fn list(s: &Session, prefix: &str) -> Result<Vec<RemoteEntry>> {
 	let raw = s.backend().await.list(prefix).await?;
 	let mut entries: Vec<RemoteEntry> = raw
 		.into_iter()
-		.filter(|o| !(prefix.is_empty() && o.key == crypto::VAULT_KEY))
+		.filter(|o| o.key.trim_end_matches('/').rsplit('/').next() != Some(crypto::VAULT_KEY))
 		.map(|o| raw_to_entry(o, s.keys.as_deref()))
 		.collect();
 	entries.sort_by(|a, b| {

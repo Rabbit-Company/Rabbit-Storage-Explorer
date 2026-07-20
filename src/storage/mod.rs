@@ -109,6 +109,22 @@ pub trait StorageBackend: Send + Sync {
 	/// Upload a whole (small) object.
 	async fn put(&self, key: &str, data: Vec<u8>) -> Result<()>;
 
+	/// Fetch the E2EE vault metadata for this connection.
+	///
+	/// Default: the `.rse-vault` object at the session root. That is correct
+	/// for backends whose root *is* the storage unit (S3 bucket, NFS export,
+	/// SMB directory). SFTP overrides this: its root is just a movable browse
+	/// path inside a per-account namespace, so the vault is anchored to the
+	/// account (home directory) instead.
+	async fn get_vault(&self) -> Result<Option<Vec<u8>>> {
+		self.get(crate::crypto::VAULT_KEY).await
+	}
+
+	/// Store the E2EE vault metadata. See [`StorageBackend::get_vault`].
+	async fn put_vault(&self, data: Vec<u8>) -> Result<()> {
+		self.put(crate::crypto::VAULT_KEY, data).await
+	}
+
 	/// Ensure parent "directories" of `key` exist. No-op for object stores;
 	/// SFTP creates the directory chain.
 	async fn prepare_parents(&self, _key: &str) -> Result<()> {

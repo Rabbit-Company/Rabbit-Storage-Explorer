@@ -114,9 +114,17 @@ machine - the app falls back to the edit form so you can re-enter the secret.
 - **Filenames:** each path segment encrypted with AES-256-SIV (deterministic, so
   listing/navigation still works) and base32-encoded. Trade-off: identical names
   produce identical ciphertexts (an observer can correlate, but not read, names).
-- The first E2EE connection initializes a small `.rse-vault` object/file at the
-  storage root (random salt + an encrypted canary used to verify your password
-  on later connects). The password itself is never stored anywhere.
+- The first E2EE connection initializes a small `.rse-vault` file (random salt + an encrypted canary
+  used to verify your password on later connects). Its
+  location is the storage unit's root: the bucket root for S3, the export root
+  for NFS, the configured directory for SMB. For SFTP it is anchored to the
+  _account_, not the browsed directory: it lives in the SSH user's home
+  (`/home/ziga/.rse-vault`), so changing the connection's remote directory
+  still opens the same vault and previously encrypted data stays readable.
+  Accounts without a home directory share a global vault at
+  `/var/lib/rabbit-storage-explorer/.rse-vault` (world-readable; an admin may
+  need to `mkdir -m 1777 /var/lib/rabbit-storage-explorer` first). The
+  password itself is never stored anywhere.
 
 **Warnings that come with real E2EE:** if you lose the password, the data is
 unrecoverable - there is no reset. Mixing encrypted and unencrypted files in one
