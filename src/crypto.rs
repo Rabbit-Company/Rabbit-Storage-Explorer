@@ -12,16 +12,16 @@
 //!   prefix listing and navigation still work. (Trade-off: an observer can see
 //!   that two objects share a name/folder, but not what the name is.)
 
-use aes_siv::siv::Aes256Siv;
+use aes_siv::{siv::Aes256Siv, KeyInit as AesSivKeyInit};
 use anyhow::{anyhow, bail, Context, Result};
 use argon2::Argon2;
 use chacha20poly1305::{
-	aead::{Aead, KeyInit},
+	aead::{Aead, KeyInit as ChaChaKeyInit},
 	ChaCha20Poly1305, Nonce,
 };
 use data_encoding::BASE32HEX_NOPAD;
 use hkdf::Hkdf;
-use rand::RngCore;
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use zeroize::{Zeroize, ZeroizeOnDrop};
@@ -71,7 +71,7 @@ impl Encryptor {
 	pub fn new(keys: &VaultKeys) -> Self {
 		let cipher = ChaCha20Poly1305::new_from_slice(&keys.content).expect("32-byte key");
 		let mut prefix = [0u8; 8];
-		rand::thread_rng().fill_bytes(&mut prefix);
+		rand::rng().fill_bytes(&mut prefix);
 		Self {
 			cipher,
 			prefix,
@@ -89,14 +89,14 @@ impl Encryptor {
 
 	/// Seal one chunk (must be called in order; `last` on the final chunk).
 	pub fn seal_chunk(&mut self, plaintext: &[u8], last: bool) -> Result<Vec<u8>> {
-		let nonce = chunk_nonce(&self.prefix, self.counter, last);
+		let nonce = Nonce::from(chunk_nonce(&self.prefix, self.counter, last));
 		self.counter = self
 			.counter
 			.checked_add(1)
 			.ok_or_else(|| anyhow!("file too large (chunk counter overflow)"))?;
 		self
 			.cipher
-			.encrypt(Nonce::from_slice(&nonce), plaintext)
+			.encrypt(&nonce, plaintext)
 			.map_err(|_| anyhow!("encryption failed"))
 	}
 }
@@ -123,11 +123,12 @@ impl Decryptor {
 	}
 
 	pub fn open_chunk(&mut self, ciphertext: &[u8], last: bool) -> Result<Vec<u8>> {
-		let nonce = chunk_nonce(&self.prefix, self.counter, last);
+		let nonce = Nonce::from(chunk_nonce(&self.prefix, self.counter, last));
 		self.counter += 1;
+
 		self
 			.cipher
-			.decrypt(Nonce::from_slice(&nonce), ciphertext)
+			.decrypt(&nonce, ciphertext)
 			.map_err(|_| anyhow!("decryption failed - wrong password or corrupted data"))
 	}
 }
@@ -248,7 +249,7 @@ pub struct VaultFile {
 pub fn create_vault(password: &str) -> Result<(VaultFile, VaultKeys)> {
 	use base64::Engine;
 	let mut salt = [0u8; 16];
-	rand::thread_rng().fill_bytes(&mut salt);
+	rand::rng().fill_bytes(&mut salt);
 	let keys = derive_keys(password, &salt)?;
 	let canary = encrypt_bytes(&keys, CANARY)?;
 	let b64 = base64::engine::general_purpose::STANDARD;
