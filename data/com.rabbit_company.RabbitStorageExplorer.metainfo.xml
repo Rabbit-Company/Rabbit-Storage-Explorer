@@ -61,11 +61,13 @@
 	<supports>
 		<control>pointing</control>
 		<control>keyboard</control>
+		<control>tablet</control>
 		<control>touch</control>
 	</supports>
 
 	<url type="homepage">https://rabbit-company.com</url>
 	<url type="bugtracker">https://github.com/Rabbit-Company/Rabbit-Storage-Explorer/issues</url>
 	<url type="vcs-browser">https://github.com/Rabbit-Company/Rabbit-Storage-Explorer</url>
+	<url type="donation">https://rabbit-company.com/donation</url>
 	<url type="contact">https://rabbit-company.com/contact</url>
 </component>

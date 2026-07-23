@@ -1,0 +1,45 @@
+{
+	"app-id": "com.rabbit_company.RabbitStorageExplorer",
+	"runtime": "org.gnome.Platform",
+	"runtime-version": "50",
+	"sdk": "org.gnome.Sdk",
+	"sdk-extensions": ["org.freedesktop.Sdk.Extension.rust-stable"],
+	"command": "rabbit-storage-explorer",
+	"finish-args": [
+		"--share=ipc",
+		"--socket=wayland",
+		"--socket=fallback-x11",
+		"--share=network",
+		"--device=dri",
+		"--filesystem=home",
+		"--talk-name=org.freedesktop.secrets"
+	],
+	"build-options": {
+		"append-path": "/usr/lib/sdk/rust-stable/bin",
+		"env": {
+			"CARGO_HOME": "/run/build/rabbit-storage-explorer/cargo"
+		}
+	},
+	"modules": [
+		{
+			"name": "rabbit-storage-explorer",
+			"buildsystem": "simple",
+			"build-commands": [
+				"cargo --offline fetch --manifest-path Cargo.toml --verbose",
+				"cargo --offline build --release --verbose",
+				"install -Dm755 target/release/rabbit-storage-explorer -t /app/bin/",
+				"install -Dm644 data/com.rabbit_company.RabbitStorageExplorer.desktop -t /app/share/applications/",
+				"install -Dm644 data/com.rabbit_company.RabbitStorageExplorer.metainfo.xml -t /app/share/metainfo/",
+				"install -Dm644 data/com.rabbit_company.RabbitStorageExplorer.svg -t /app/share/icons/hicolor/scalable/apps/"
+			],
+			"sources": [
+				{
+					"type": "dir",
+					"path": ".",
+					"skip": ["target", ".git", ".flatpak-builder", "build-dir"]
+				},
+				"cargo-sources.json"
+			]
+		}
+	]
+}

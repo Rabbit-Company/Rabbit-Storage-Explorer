@@ -2,7 +2,7 @@
 Name=Rabbit Storage Explorer
 GenericName=Storage Explorer
 Comment=Browse, upload and download files on S3-compatible, NFS, SMB and SFTP storage with optional end-to-end encryption
-Keywords=storage;s3;nfs;smb;sftp;ssh;bucket;upload;download;encryption;
+Keywords=storage;s3;nfs;smb;sftp;ssh;bucket;upload;download;encryption;e2ee;
 Exec=rabbit-storage-explorer
 Icon=com.rabbit_company.RabbitStorageExplorer
 Version=1.0
