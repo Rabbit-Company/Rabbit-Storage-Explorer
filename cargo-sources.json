@@ -353,14 +353,14 @@
     {
         "type": "archive",
         "archive-type": "tar-gzip",
-        "url": "https://static.crates.io/crates/aws-config/aws-config-1.10.0.crate",
-        "sha256": "701418aa459dac33e50a0f8e818e5662a16bc018a6ac7423659b70f3799d67a8",
-        "dest": "cargo/vendor/aws-config-1.10.0"
+        "url": "https://static.crates.io/crates/aws-config/aws-config-1.10.1.crate",
+        "sha256": "1b180a3c8b55960db3426d8964b8745e652466a1a49fe1a2eda828046d30b5e4",
+        "dest": "cargo/vendor/aws-config-1.10.1"
     },
     {
         "type": "inline",
-        "contents": "{\"package\": \"701418aa459dac33e50a0f8e818e5662a16bc018a6ac7423659b70f3799d67a8\", \"files\": {}}",
-        "dest": "cargo/vendor/aws-config-1.10.0",
+        "contents": "{\"package\": \"1b180a3c8b55960db3426d8964b8745e652466a1a49fe1a2eda828046d30b5e4\", \"files\": {}}",
+        "dest": "cargo/vendor/aws-config-1.10.1",
         "dest-filename": ".cargo-checksum.json"
     },
     {
@@ -405,66 +405,66 @@
     {
         "type": "archive",
         "archive-type": "tar-gzip",
-        "url": "https://static.crates.io/crates/aws-runtime/aws-runtime-1.9.0.crate",
-        "sha256": "a6b50a43f3ccdf331521c6d6c68b7cc9668b6e09d439ebda9569df5722324d76",
-        "dest": "cargo/vendor/aws-runtime-1.9.0"
+        "url": "https://static.crates.io/crates/aws-runtime/aws-runtime-1.9.1.crate",
+        "sha256": "c9007227e10b5fed2f3e0a2beff489211e2b5604c400b7a9d5d81ca9d64c24bb",
+        "dest": "cargo/vendor/aws-runtime-1.9.1"
     },
     {
         "type": "inline",
-        "contents": "{\"package\": \"a6b50a43f3ccdf331521c6d6c68b7cc9668b6e09d439ebda9569df5722324d76\", \"files\": {}}",
-        "dest": "cargo/vendor/aws-runtime-1.9.0",
+        "contents": "{\"package\": \"c9007227e10b5fed2f3e0a2beff489211e2b5604c400b7a9d5d81ca9d64c24bb\", \"files\": {}}",
+        "dest": "cargo/vendor/aws-runtime-1.9.1",
         "dest-filename": ".cargo-checksum.json"
     },
     {
         "type": "archive",
         "archive-type": "tar-gzip",
-        "url": "https://static.crates.io/crates/aws-sdk-s3/aws-sdk-s3-1.139.0.crate",
-        "sha256": "a159b9721a6a41468f967d1029bece78f410b0beb0594498435deb6ff72bfe48",
-        "dest": "cargo/vendor/aws-sdk-s3-1.139.0"
+        "url": "https://static.crates.io/crates/aws-sdk-s3/aws-sdk-s3-1.140.0.crate",
+        "sha256": "e9660cf991e512fbe6094f1041ff3d3282bc5aeeeb6184e8de437ec2de024a10",
+        "dest": "cargo/vendor/aws-sdk-s3-1.140.0"
     },
     {
         "type": "inline",
-        "contents": "{\"package\": \"a159b9721a6a41468f967d1029bece78f410b0beb0594498435deb6ff72bfe48\", \"files\": {}}",
-        "dest": "cargo/vendor/aws-sdk-s3-1.139.0",
+        "contents": "{\"package\": \"e9660cf991e512fbe6094f1041ff3d3282bc5aeeeb6184e8de437ec2de024a10\", \"files\": {}}",
+        "dest": "cargo/vendor/aws-sdk-s3-1.140.0",
         "dest-filename": ".cargo-checksum.json"
     },
     {
         "type": "archive",
         "archive-type": "tar-gzip",
-        "url": "https://static.crates.io/crates/aws-sdk-sso/aws-sdk-sso-1.104.0.crate",
-        "sha256": "b53416d16c278234845392e38d93bd4481d2f09daa0f005a2277f0aa91f59c22",
-        "dest": "cargo/vendor/aws-sdk-sso-1.104.0"
+        "url": "https://static.crates.io/crates/aws-sdk-sso/aws-sdk-sso-1.105.0.crate",
+        "sha256": "6ffd0fbe7873cb548a7aa60f9573c268fff94155397fd4f14dc9f1ecaaab8516",
+        "dest": "cargo/vendor/aws-sdk-sso-1.105.0"
     },
     {
         "type": "inline",
-        "contents": "{\"package\": \"b53416d16c278234845392e38d93bd4481d2f09daa0f005a2277f0aa91f59c22\", \"files\": {}}",
-        "dest": "cargo/vendor/aws-sdk-sso-1.104.0",
+        "contents": "{\"package\": \"6ffd0fbe7873cb548a7aa60f9573c268fff94155397fd4f14dc9f1ecaaab8516\", \"files\": {}}",
+        "dest": "cargo/vendor/aws-sdk-sso-1.105.0",
         "dest-filename": ".cargo-checksum.json"
     },
     {
         "type": "archive",
         "archive-type": "tar-gzip",
-        "url": "https://static.crates.io/crates/aws-sdk-ssooidc/aws-sdk-ssooidc-1.106.0.crate",
-        "sha256": "cc9b706c3305ed0285d5b1b696c747aa34950f830fb03e3e6c76890f99b9f188",
-        "dest": "cargo/vendor/aws-sdk-ssooidc-1.106.0"
+        "url": "https://static.crates.io/crates/aws-sdk-ssooidc/aws-sdk-ssooidc-1.107.0.crate",
+        "sha256": "175763eb222a46377df7aa257a3bca980ab3e96703fefc8f4d0b8da6ad2e254c",
+        "dest": "cargo/vendor/aws-sdk-ssooidc-1.107.0"
     },
     {
         "type": "inline",
-        "contents": "{\"package\": \"cc9b706c3305ed0285d5b1b696c747aa34950f830fb03e3e6c76890f99b9f188\", \"files\": {}}",
-        "dest": "cargo/vendor/aws-sdk-ssooidc-1.106.0",
+        "contents": "{\"package\": \"175763eb222a46377df7aa257a3bca980ab3e96703fefc8f4d0b8da6ad2e254c\", \"files\": {}}",
+        "dest": "cargo/vendor/aws-sdk-ssooidc-1.107.0",
         "dest-filename": ".cargo-checksum.json"
     },
     {
         "type": "archive",
         "archive-type": "tar-gzip",
-        "url": "https://static.crates.io/crates/aws-sdk-sts/aws-sdk-sts-1.109.0.crate",
-        "sha256": "32d214cdfa5bbe17f117e76a7643fadf32a5234fb597322ef8b1fb4b2f17dbbd",
-        "dest": "cargo/vendor/aws-sdk-sts-1.109.0"
+        "url": "https://static.crates.io/crates/aws-sdk-sts/aws-sdk-sts-1.110.0.crate",
+        "sha256": "dd8b14781dfbff48984017d57167b6ea0b6471c6920ec52b44a2677c7feb3c13",
+        "dest": "cargo/vendor/aws-sdk-sts-1.110.0"
     },
     {
         "type": "inline",
-        "contents": "{\"package\": \"32d214cdfa5bbe17f117e76a7643fadf32a5234fb597322ef8b1fb4b2f17dbbd\", \"files\": {}}",
-        "dest": "cargo/vendor/aws-sdk-sts-1.109.0",
+        "contents": "{\"package\": \"dd8b14781dfbff48984017d57167b6ea0b6471c6920ec52b44a2677c7feb3c13\", \"files\": {}}",
+        "dest": "cargo/vendor/aws-sdk-sts-1.110.0",
         "dest-filename": ".cargo-checksum.json"
     },
     {
@@ -587,27 +587,27 @@
     {
         "type": "archive",
         "archive-type": "tar-gzip",
-        "url": "https://static.crates.io/crates/aws-smithy-runtime/aws-smithy-runtime-1.12.0.crate",
-        "sha256": "bea94a9ff8464016338c851e24b472d7131c388c88898a502e781815b2ee6045",
-        "dest": "cargo/vendor/aws-smithy-runtime-1.12.0"
+        "url": "https://static.crates.io/crates/aws-smithy-runtime/aws-smithy-runtime-1.12.1.crate",
+        "sha256": "07505b34e8f4b3591a4fa69e9792b52289b95488dbbc68c3c0075b7bedb245e1",
+        "dest": "cargo/vendor/aws-smithy-runtime-1.12.1"
     },
     {
         "type": "inline",
-        "contents": "{\"package\": \"bea94a9ff8464016338c851e24b472d7131c388c88898a502e781815b2ee6045\", \"files\": {}}",
-        "dest": "cargo/vendor/aws-smithy-runtime-1.12.0",
+        "contents": "{\"package\": \"07505b34e8f4b3591a4fa69e9792b52289b95488dbbc68c3c0075b7bedb245e1\", \"files\": {}}",
+        "dest": "cargo/vendor/aws-smithy-runtime-1.12.1",
         "dest-filename": ".cargo-checksum.json"
     },
     {
         "type": "archive",
         "archive-type": "tar-gzip",
-        "url": "https://static.crates.io/crates/aws-smithy-runtime-api/aws-smithy-runtime-api-1.13.0.crate",
-        "sha256": "22ed1ebe6e0a95ea84570225f5a8208dec4b8f77e61a9b0d6f51773fcb4612f0",
-        "dest": "cargo/vendor/aws-smithy-runtime-api-1.13.0"
+        "url": "https://static.crates.io/crates/aws-smithy-runtime-api/aws-smithy-runtime-api-1.14.0.crate",
+        "sha256": "3b98f2e1fd67ec06618f9c291e5e495a468e60519e44c9c1979cd0521f3affdb",
+        "dest": "cargo/vendor/aws-smithy-runtime-api-1.14.0"
     },
     {
         "type": "inline",
-        "contents": "{\"package\": \"22ed1ebe6e0a95ea84570225f5a8208dec4b8f77e61a9b0d6f51773fcb4612f0\", \"files\": {}}",
-        "dest": "cargo/vendor/aws-smithy-runtime-api-1.13.0",
+        "contents": "{\"package\": \"3b98f2e1fd67ec06618f9c291e5e495a468e60519e44c9c1979cd0521f3affdb\", \"files\": {}}",
+        "dest": "cargo/vendor/aws-smithy-runtime-api-1.14.0",
         "dest-filename": ".cargo-checksum.json"
     },
     {
@@ -990,14 +990,14 @@
     {
         "type": "archive",
         "archive-type": "tar-gzip",
-        "url": "https://static.crates.io/crates/cc/cc-1.3.0.crate",
-        "sha256": "c89588d05638b5b4594a3348a2d6c20277e43a7f5c5202b05cc56888475a47b8",
-        "dest": "cargo/vendor/cc-1.3.0"
+        "url": "https://static.crates.io/crates/cc/cc-1.4.0.crate",
+        "sha256": "5add81bb678e6cb321aff7fa0dc7689ad82b112dbc032cea19f91d6b8e3582b9",
+        "dest": "cargo/vendor/cc-1.4.0"
     },
     {
         "type": "inline",
-        "contents": "{\"package\": \"c89588d05638b5b4594a3348a2d6c20277e43a7f5c5202b05cc56888475a47b8\", \"files\": {}}",
-        "dest": "cargo/vendor/cc-1.3.0",
+        "contents": "{\"package\": \"5add81bb678e6cb321aff7fa0dc7689ad82b112dbc032cea19f91d6b8e3582b9\", \"files\": {}}",
+        "dest": "cargo/vendor/cc-1.4.0",
         "dest-filename": ".cargo-checksum.json"
     },
     {
@@ -1666,14 +1666,14 @@
     {
         "type": "archive",
         "archive-type": "tar-gzip",
-        "url": "https://static.crates.io/crates/either/either-1.16.0.crate",
-        "sha256": "91622ff5e7162018101f2fea40d6ebf4a78bbe5a49736a2020649edf9693679e",
-        "dest": "cargo/vendor/either-1.16.0"
+        "url": "https://static.crates.io/crates/either/either-1.17.0.crate",
+        "sha256": "9e5e8f6c15a24b9a3ee5efec809ccd006d3b30e8b3bb63c39af737c7f87daa1d",
+        "dest": "cargo/vendor/either-1.17.0"
     },
     {
         "type": "inline",
-        "contents": "{\"package\": \"91622ff5e7162018101f2fea40d6ebf4a78bbe5a49736a2020649edf9693679e\", \"files\": {}}",
-        "dest": "cargo/vendor/either-1.16.0",
+        "contents": "{\"package\": \"9e5e8f6c15a24b9a3ee5efec809ccd006d3b30e8b3bb63c39af737c7f87daa1d\", \"files\": {}}",
+        "dest": "cargo/vendor/either-1.17.0",
         "dest-filename": ".cargo-checksum.json"
     },
     {
