@@ -917,7 +917,7 @@ async fn run_download(
 			let mut attempt = 0u32;
 			let result = loop {
 				progress.file_start(&rel, size); // (re)sets the per-file tracker on retries
-				let r = download_one(&s, &key, &rel, &out_path, &progress).await;
+				let r = download_one(&s, &key, &rel, &out_path, &progress, &cancel).await;
 				match r {
 					Ok(()) => break Ok(()),
 					Err(_) if attempt < st.retries && !cancel.is_cancelled() => {
@@ -970,7 +970,11 @@ async fn download_one(
 	name: &str,
 	out_path: &PathBuf,
 	progress: &Progress,
+	cancel: &CancellationToken,
 ) -> Result<()> {
+	if cancel.is_cancelled() {
+		return Err(anyhow!("cancelled"));
+	}
 	if let Some(parent) = out_path.parent() {
 		tokio::fs::create_dir_all(parent).await?;
 	}
@@ -988,11 +992,15 @@ async fn download_one(
 	let result: Result<()> = async {
 		match s.keys.as_deref() {
 			None => {
-				// Manual copy loop so the progress bar moves *during* the
-				// download instead of jumping to 100% at the end.
 				let mut buf = vec![0u8; 256 * 1024];
 				loop {
-					let n = read_or_stall(reader.read(&mut buf)).await?;
+					// select! so a read blocked on a dead-slow network also
+					// aborts the instant Cancel is pressed, not just between reads.
+					let n = tokio::select! {
+						biased;
+						_ = cancel.cancelled() => return Err(anyhow!("cancelled")),
+						r = read_or_stall(reader.read(&mut buf)) => r?,
+					};
 					if n == 0 {
 						break;
 					}
@@ -1012,9 +1020,13 @@ async fn download_one(
 				for i in 0..n_chunks {
 					let last = i == n_chunks - 1;
 					let clen = if last { last_len } else { crypto::CIPHER_CHUNK };
-					read_or_stall(reader.read_exact(&mut buf[..clen]))
-						.await
-						.context("reading chunk")?;
+					tokio::select! {
+						biased;
+						_ = cancel.cancelled() => return Err(anyhow!("cancelled")),
+						r = read_or_stall(reader.read_exact(&mut buf[..clen])) => {
+							r.context("reading chunk")?;
+						}
+					}
 					let plain = dec.open_chunk(&buf[..clen], last)?;
 					file.write_all(&plain).await?;
 					progress.tick(name, plain.len() as u64);
@@ -1030,7 +1042,7 @@ async fn download_one(
 	if result.is_ok() {
 		tokio::fs::rename(&tmp, out_path).await?;
 	} else {
-		let _ = tokio::fs::remove_file(&tmp).await;
+		let _ = tokio::fs::remove_file(&tmp).await; // partial .rse-part is cleaned up
 	}
 	result
 }
