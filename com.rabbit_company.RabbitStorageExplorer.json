@@ -36,7 +36,7 @@
 				{
 					"type": "archive",
 					"url": "https://github.com/Rabbit-Company/Rabbit-Storage-Explorer/archive/refs/tags/v1.0.0.tar.gz",
-					"sha256": "REPLACE_WITH_RELEASE_TARBALL_SHA256"
+					"sha256": "64a366165de816f6b6f6d58a24f2c40b46aff7e4ab5aab966d1c53faeb775e76"
 				},
 				"cargo-sources.json"
 			]
