@@ -40,12 +40,24 @@
 
 	<screenshots>
 		<screenshot type="default">
-			<image type="source">https://cdn.rabbit-company.com/RabbitStorageExplorer/screenshots/browser.png</image>
-			<caption>File browser</caption>
+			<image type="source">https://cdn.rabbit-company.com/RabbitStorageExplorer/screenshots/explorer.png</image>
+			<caption>File explorer</caption>
 		</screenshot>
 		<screenshot>
 			<image type="source">https://cdn.rabbit-company.com/RabbitStorageExplorer/screenshots/connections.png</image>
-			<caption>Connection manager</caption>
+			<caption>Connections</caption>
+		</screenshot>
+		<screenshot>
+			<image type="source">https://cdn.rabbit-company.com/RabbitStorageExplorer/screenshots/connection-add.png</image>
+			<caption>Add Connection</caption>
+		</screenshot>
+		<screenshot>
+			<image type="source">https://cdn.rabbit-company.com/RabbitStorageExplorer/screenshots/transfers.png</image>
+			<caption>Transfers</caption>
+		</screenshot>
+		<screenshot>
+			<image type="source">https://cdn.rabbit-company.com/RabbitStorageExplorer/screenshots/settings.png</image>
+			<caption>Settings</caption>
 		</screenshot>
 	</screenshots>
 
