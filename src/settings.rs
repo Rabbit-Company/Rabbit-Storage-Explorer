@@ -24,6 +24,10 @@ pub struct Settings {
 	pub part_size_mib: u64,
 	/// Retries per object before it is reported as failed.
 	pub retries: u32,
+	/// Fixed delay between reconnect/retry attempts after the connection
+	/// drops (seconds). A short value resumes transfers quickly once the
+	/// network returns.
+	pub reconnect_interval_secs: u64,
 }
 
 impl Default for Settings {
@@ -33,7 +37,8 @@ impl Default for Settings {
 			download_parallelism: 6,
 			multipart_threshold_mib: 64,
 			part_size_mib: 16,
-			retries: 3,
+			retries: 500_000,
+			reconnect_interval_secs: 3,
 		}
 	}
 }

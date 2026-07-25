@@ -12,7 +12,7 @@ bulk drag-and-drop uploads (thousands of small files) with optional
 - Connection manager: save multiple connections, connect with one click
   (E2EE connections just ask for the password), edit or delete saved entries
 - Parallel transfer engine (defaults: 12 concurrent uploads, 6 downloads) with
-  retries, exponential backoff and cancellation
+  retries and cancellation
 - Survives network changes: if the connection drops mid-transfer (Wi-Fi switch,
   brief outage), the app reconnects automatically and retries the affected files
 - Optional E2EE: file **contents and names** are encrypted on your machine before
@@ -130,10 +130,11 @@ location works but is best avoided.
 
 ## Defaults (changeable in Settings ⚙)
 
-| Setting             | Default | Why                                                          |
-| ------------------- | ------- | ------------------------------------------------------------ |
-| Parallel uploads    | 12      | Thousands of small files are latency-bound; parallelism wins |
-| Parallel downloads  | 6       | Balanced against local disk write pressure                   |
-| Multipart threshold | 64 MiB  | Small objects are cheaper as single PUTs                     |
-| Part size           | 16 MiB  | Fewer requests per large file; the S3 minimum is 5 MiB       |
-| Retries             | 3       | Exponential backoff, per file                                |
+| Setting             | Default | Why                                                                         |
+| ------------------- | ------- | --------------------------------------------------------------------------- |
+| Parallel uploads    | 12      | Thousands of small files are latency-bound; parallelism wins                |
+| Parallel downloads  | 6       | Balanced against local disk write pressure                                  |
+| Multipart threshold | 64 MiB  | Small objects are cheaper as single PUTs                                    |
+| Part size           | 16 MiB  | Fewer requests per large file; the S3 minimum is 5 MiB                      |
+| Retries             | 500000  | Retries per object before it is reported as failed                          |
+| Reconnect interval  | 3       | Delay between reconnect/retry attempts after the connection drops (seconds) |

@@ -156,6 +156,8 @@ struct Conn {
 	/// Serializes reconnect attempts: one task rebuilds, the rest wait.
 	reconnect: tokio::sync::Mutex<()>,
 	generation: AtomicU64,
+	/// Fixed reconnect/retry delay in milliseconds; updated live on SetSettings.
+	reconnect_interval_ms: AtomicU64,
 	ev: async_channel::Sender<Event>,
 }
 
@@ -164,9 +166,17 @@ impl Session {
 		self.conn.backend.read().await.clone()
 	}
 
-	/// Called between retries. If the backend is unreachable (e.g. the network
-	/// changed), rebuild it from the stored credentials, waiting with backoff
-	/// until connectivity returns or the transfer is cancelled.
+	fn reconnect_delay(&self) -> Duration {
+		Duration::from_millis(
+			self
+				.conn
+				.reconnect_interval_ms
+				.load(Ordering::Relaxed)
+				.max(200),
+		)
+	}
+
+	/// Called between retries.
 	async fn wait_until_healthy(&self, cancel: &CancellationToken) {
 		let check = |b: Arc<dyn StorageBackend>| async move {
 			tokio::time::timeout(Duration::from_secs(10), b.health_check())
@@ -189,8 +199,7 @@ impl Session {
 			.send(Event::Toast("Connection lost - reconnecting...".into()))
 			.await;
 
-		let mut delay = Duration::from_secs(1);
-		for _ in 0..8 {
+		loop {
 			if cancel.is_cancelled() {
 				return;
 			}
@@ -203,15 +212,12 @@ impl Session {
 				}
 				Err(_) => {
 					tokio::select! {
-							_ = cancel.cancelled() => return,
-							_ = tokio::time::sleep(delay) => {}
+						_ = cancel.cancelled() => return,
+						_ = tokio::time::sleep(self.reconnect_delay()) => {}
 					}
-					delay = (delay * 2).min(Duration::from_secs(15));
 				}
 			}
 		}
-		// Attempts exhausted (~1.5 min): give up for now. The per-file retry
-		// loop re-enters here on its next attempt, extending the window.
 	}
 }
 
@@ -242,7 +248,15 @@ async fn dispatch(cmd_rx: async_channel::Receiver<Command>, ev: async_channel::S
 
 	while let Ok(cmd) = cmd_rx.recv().await {
 		match cmd {
-			Command::SetSettings(s) => settings = s,
+			Command::SetSettings(s) => {
+				if let Some(sess) = &session {
+					sess
+						.conn
+						.reconnect_interval_ms
+						.store(s.reconnect_interval_secs.max(1) * 1000, Ordering::Relaxed);
+				}
+				settings = s;
+			}
 
 			Command::Disconnect => {
 				hub.cancel_all();
@@ -255,7 +269,15 @@ async fn dispatch(cmd_rx: async_channel::Receiver<Command>, ev: async_channel::S
 				profile,
 				secret_key,
 				password,
-			} => match connect(&profile, &secret_key, password.as_deref(), ev.clone()).await {
+			} => match connect(
+				&profile,
+				&secret_key,
+				password.as_deref(),
+				settings.reconnect_interval_secs.max(1) * 1000,
+				ev.clone(),
+			)
+			.await
+			{
 				Ok(s) => {
 					let e2ee = s.keys.is_some();
 					session = Some(s);
@@ -374,6 +396,7 @@ async fn connect(
 	profile: &ConnectionProfile,
 	secret: &str,
 	password: Option<&str>,
+	reconnect_interval_ms: u64,
 	ev: async_channel::Sender<Event>,
 ) -> Result<Session> {
 	let backend = connect_backend(profile, secret).await?;
@@ -417,6 +440,7 @@ async fn connect(
 			backend: tokio::sync::RwLock::new(backend),
 			reconnect: tokio::sync::Mutex::new(()),
 			generation: AtomicU64::new(0),
+			reconnect_interval_ms: AtomicU64::new(reconnect_interval_ms),
 			ev,
 		}),
 	})
@@ -867,7 +891,7 @@ async fn upload_one(
 			Err(_) if attempt < st.retries && !cancel.is_cancelled() => {
 				attempt += 1;
 				s.wait_until_healthy(cancel).await;
-				tokio::time::sleep(Duration::from_millis(400 * (1 << attempt.min(4)))).await;
+				tokio::time::sleep(s.reconnect_delay()).await;
 			}
 			Err(e) => return Err(e),
 		}

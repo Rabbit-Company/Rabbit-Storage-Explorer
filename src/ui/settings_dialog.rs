@@ -13,7 +13,7 @@ pub fn present(
 
 	let up = spin_row(
 		"Parallel uploads",
-		"Concurrent objects sent at once (small files benefit from high values)",
+		"Concurrent objects sent at once",
 		1.0,
 		64.0,
 		current.upload_parallelism as f64,
@@ -27,14 +27,22 @@ pub fn present(
 	);
 	let retries = spin_row(
 		"Retries per file",
-		"Failed transfers are retried with exponential backoff",
+		"Failed transfers are retried at the reconnect interval below",
 		0.0,
-		10.0,
+		1_000_000.0,
 		current.retries as f64,
+	);
+	let reconnect = spin_row(
+		"Reconnect interval (seconds)",
+		"How often to retry after the connection drops",
+		1.0,
+		600.0,
+		current.reconnect_interval_secs as f64,
 	);
 	transfers.add(&up);
 	transfers.add(&down);
 	transfers.add(&retries);
+	transfers.add(&reconnect);
 
 	let large = adw::PreferencesGroup::builder()
 		.title("Large files")
@@ -71,6 +79,7 @@ pub fn present(
 			retries: retries.value() as u32,
 			multipart_threshold_mib: threshold.value() as u64,
 			part_size_mib: part.value() as u64,
+			reconnect_interval_secs: reconnect.value() as u64,
 		});
 	});
 
