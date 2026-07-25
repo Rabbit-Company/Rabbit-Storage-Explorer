@@ -40,3 +40,8 @@ box.drop-into {
 	background-color: transparent;
 	box-shadow: none;
 }
+
+progressbar.stalled > trough > progress,
+.transfers-list.stalled progressbar > trough > progress {
+	background-color: @warning_bg_color;
+}

@@ -67,12 +67,16 @@ pub struct BrowserPage {
 	global_speed_bps: Cell<f64>,
 	/// Stat labels of the open transfers dialog, if any.
 	stats_widgets: RefCell<Option<StatsWidgets>>,
+	transferring: Cell<bool>,
+	stalled: Cell<bool>,
+	last_progress: Cell<std::time::Instant>,
 }
 
 struct StatsWidgets {
 	speed: gtk::Label,
 	transferred: gtk::Label,
 	eta: gtk::Label,
+	list: gtk::ListView,
 }
 
 impl BrowserPage {
@@ -255,6 +259,9 @@ impl BrowserPage {
 			bytes_done: Cell::new(0),
 			global_speed_bps: Cell::new(0.0),
 			stats_widgets: RefCell::new(None),
+			transferring: Cell::new(false),
+			stalled: Cell::new(false),
+			last_progress: Cell::new(std::time::Instant::now()),
 		});
 
 		*ctx_page.borrow_mut() = Rc::downgrade(&page);
@@ -343,6 +350,20 @@ impl BrowserPage {
 		overlay.add_controller(target);
 
 		page.rebuild_breadcrumbs();
+
+		// Poll once a second: a running transfer with no progress event for a
+		// few seconds means the connection dropped and the stats are stale.
+		let weak = page.weak_self.clone();
+		glib::timeout_add_local(std::time::Duration::from_secs(1), move || {
+			match weak.upgrade() {
+				Some(p) => {
+					p.check_stall();
+					glib::ControlFlow::Continue
+				}
+				None => glib::ControlFlow::Break,
+			}
+		});
+
 		page
 	}
 
@@ -713,6 +734,10 @@ impl BrowserPage {
 		self.global_speed_bps.set(0.0);
 		self.bar_progress.set_fraction(0.0);
 		self.bar_percent.set_text("0.00%");
+		self.transferring.set(true);
+		self.stalled.set(false);
+		self.last_progress.set(std::time::Instant::now());
+		self.bar_progress.remove_css_class("stalled");
 
 		self.transfer_store.remove_all();
 		let mut index = self.transfer_index.borrow_mut();
@@ -741,6 +766,11 @@ impl BrowserPage {
 		files: Vec<FileProgress>,
 		finished: Option<(String, bool)>,
 	) {
+		self.last_progress.set(std::time::Instant::now());
+		if self.stalled.get() {
+			self.set_stalled(false);
+		}
+
 		let total_f = self.total_files.get().max(1);
 		let total_b = self.total_bytes.get();
 		let fraction = if total_b > 0 {
@@ -781,6 +811,9 @@ impl BrowserPage {
 	}
 
 	pub fn transfer_finished(&self) {
+		self.transferring.set(false);
+		self.stalled.set(false);
+		self.bar_progress.remove_css_class("stalled");
 		self.bar.set_reveal_child(false);
 		self.transfer_store.remove_all();
 		self.transfer_index.borrow_mut().clear();
@@ -793,6 +826,20 @@ impl BrowserPage {
 		let Some(w) = &*self.stats_widgets.borrow() else {
 			return;
 		};
+
+		if self.stalled.get() {
+			w.speed.set_text("-");
+			let stalled_for = self.last_progress.get().elapsed().as_secs_f64();
+			w.eta
+				.set_text(&format!("Stalled for {}", human_eta(stalled_for)));
+			w.transferred.set_text(&format!(
+				"{} / {}",
+				human_size(self.bytes_done.get()),
+				human_size(self.total_bytes.get())
+			));
+			return;
+		}
+
 		let speed = self.global_speed_bps.get();
 		w.speed.set_text(&if speed > 0.0 {
 			format!("{:.1} Mbps", speed * 8.0 / 1_000_000.0)
@@ -810,6 +857,39 @@ impl BrowserPage {
 		} else {
 			"-".to_string()
 		});
+	}
+
+	const STALL_AFTER: std::time::Duration = std::time::Duration::from_secs(3);
+
+	fn check_stall(&self) {
+		if !self.transferring.get() {
+			return;
+		}
+		let stalled = self.last_progress.get().elapsed() >= Self::STALL_AFTER;
+		if stalled != self.stalled.get() {
+			self.set_stalled(stalled);
+		} else if stalled {
+			// Still stalled: refresh so the "Stalled for ..." duration counts up.
+			self.update_stats_widgets();
+		}
+	}
+
+	fn set_stalled(&self, stalled: bool) {
+		self.stalled.set(stalled);
+		if stalled {
+			self.bar_progress.add_css_class("stalled");
+		} else {
+			self.bar_progress.remove_css_class("stalled");
+		}
+		// Recolor the per-file bars in one shot via the list's class, if open.
+		if let Some(w) = &*self.stats_widgets.borrow() {
+			if stalled {
+				w.list.add_css_class("stalled");
+			} else {
+				w.list.remove_css_class("stalled");
+			}
+		}
+		self.update_stats_widgets();
 	}
 
 	/// Replace one row's data in place. The splice keeps the row position, so
@@ -925,6 +1005,9 @@ impl BrowserPage {
 		let view = gtk::ListView::new(Some(selection), Some(factory));
 		view.set_vexpand(true);
 		view.add_css_class("transfers-list");
+		if self.stalled.get() {
+			view.add_css_class("stalled");
+		}
 
 		let scroller = gtk::ScrolledWindow::builder()
 			.hscrollbar_policy(gtk::PolicyType::Never)
@@ -988,6 +1071,7 @@ impl BrowserPage {
 			speed,
 			transferred,
 			eta,
+			list: view.clone(),
 		});
 		let weak = self.weak_self.clone();
 

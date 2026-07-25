@@ -88,6 +88,7 @@ pub enum Event {
 	/// `files` is the full batch roster (also the still-queued ones), in
 	/// processing order, with `done = 0`.
 	TransferStarted {
+		#[allow(unused)]
 		kind: TransferKind,
 		total_files: u64,
 		total_bytes: u64,
