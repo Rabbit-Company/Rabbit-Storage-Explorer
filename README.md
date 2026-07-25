@@ -20,8 +20,6 @@ bulk drag-and-drop uploads (thousands of small files) with optional
 - All I/O, crypto and network work runs on a background tokio runtime; the GTK
   main thread only paints, so the UI never freezes
 - Secrets stored in the OS keychain, not in config files
-- The storage layer is a trait (`StorageBackend`) - adding further backends
-  (WebDAV, GCS...) does not touch the UI or transfer engine
 
 ## Building
 
