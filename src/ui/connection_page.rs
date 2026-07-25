@@ -41,6 +41,7 @@ pub struct ConnectionPage {
 	root_path: adw::EntryRow,
 	sftp_group: adw::PreferencesGroup,
 	key_path: adw::EntryRow,
+	nfs_privileged_port: adw::SwitchRow,
 	nfs_group: adw::PreferencesGroup,
 	nfs_uid: adw::SpinRow,
 	nfs_gid: adw::SpinRow,
@@ -175,6 +176,16 @@ impl ConnectionPage {
 		nfs_gid.set_value(1000.0);
 		nfs_group.add(&nfs_uid);
 		nfs_group.add(&nfs_gid);
+		let nfs_privileged_port = adw::SwitchRow::builder()
+			.title("Connect from a privileged port")
+			.subtitle(
+				"Required by most NFS servers. Turn off inside Flatpak or other \
+				 sandboxes that can't bind ports below 1024 (the server must accept \
+				 non-privileged clients).",
+			)
+			.active(true)
+			.build();
+		nfs_group.add(&nfs_privileged_port);
 
 		let smb_group = adw::PreferencesGroup::new();
 		let share = adw::EntryRow::builder().title("Share name").build();
@@ -294,6 +305,7 @@ impl ConnectionPage {
 			root_path,
 			sftp_group,
 			key_path,
+			nfs_privileged_port,
 			nfs_group,
 			nfs_uid,
 			nfs_gid,
@@ -591,6 +603,7 @@ impl ConnectionPage {
 			root_path: self.root_path.text().trim().to_string(),
 			share: self.share.text().trim().to_string(),
 			domain: self.domain.text().trim().to_string(),
+			nfs_privileged_port: self.nfs_privileged_port.is_active(),
 			nfs_uid: self.nfs_uid.value() as u32,
 			nfs_gid: self.nfs_gid.value() as u32,
 			e2ee: self.e2ee.is_active(),
@@ -687,6 +700,7 @@ impl ConnectionPage {
 		self.root_path.set_text(&p.root_path);
 		self.share.set_text(&p.share);
 		self.domain.set_text(&p.domain);
+		self.nfs_privileged_port.set_active(p.nfs_privileged_port);
 		self.nfs_uid.set_value(p.nfs_uid as f64);
 		self.nfs_gid.set_value(p.nfs_gid as f64);
 		self.e2ee.set_active(p.e2ee);

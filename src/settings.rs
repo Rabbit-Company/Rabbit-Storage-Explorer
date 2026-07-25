@@ -69,6 +69,10 @@ pub struct ConnectionProfile {
 	pub share: String,
 	/// SMB domain / workgroup (optional).
 	pub domain: String,
+	/// NFS: bind the client socket to a privileged port (0–1023). Most NFS
+	/// servers require it, but it needs privileges the Flatpak sandbox lacks.
+	/// Turn it off there (the server must allow non-privileged clients).
+	pub nfs_privileged_port: bool,
 	/// NFS AUTH_UNIX identity.
 	pub nfs_uid: u32,
 	pub nfs_gid: u32,
@@ -91,6 +95,7 @@ impl Default for ConnectionProfile {
 			root_path: String::new(),
 			share: String::new(),
 			domain: String::new(),
+			nfs_privileged_port: true,
 			nfs_uid: 1000,
 			nfs_gid: 1000,
 			e2ee: false,

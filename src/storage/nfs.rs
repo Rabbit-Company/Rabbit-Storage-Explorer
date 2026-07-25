@@ -51,6 +51,7 @@ impl NfsBackend {
 			gids: Vec::new(),
 		};
 		let mut builder = Nfs3ConnectionBuilder::new(TokioConnector, profile.host.clone(), export)
+			.connect_from_privileged_port(profile.nfs_privileged_port)
 			.credential(opaque_auth::auth_unix(&auth));
 		if profile.port != 0 {
 			builder = builder.nfs3_port(profile.port);
