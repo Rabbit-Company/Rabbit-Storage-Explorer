@@ -25,7 +25,7 @@ bulk drag-and-drop uploads (thousands of small files) with optional
 
 ## Building
 
-Requires **Rust 1.85+**, **GTK 4.10+** and **libadwaita 1.5+** development files.
+Requires **Rust 1.88+**, **GTK 4.10+** and **libadwaita 1.5+** development files.
 
 ```bash
 # Ubuntu 24.04+ / Debian 13+
