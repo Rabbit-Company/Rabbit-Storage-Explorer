@@ -131,6 +131,10 @@ impl Decryptor {
 			.decrypt(&nonce, ciphertext)
 			.map_err(|_| anyhow!("decryption failed - wrong password or corrupted data"))
 	}
+
+	pub fn seek_to(&mut self, index: u32) {
+		self.counter = index;
+	}
 }
 
 fn chunk_nonce(prefix: &[u8; 8], counter: u32, last: bool) -> [u8; 12] {

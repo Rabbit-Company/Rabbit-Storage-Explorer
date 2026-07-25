@@ -172,4 +172,27 @@ pub trait StorageBackend: Send + Sync {
 		self.delete(vec![from.to_string()]).await?;
 		Ok(())
 	}
+
+	/// Open an object for streaming starting at byte `offset`, returning
+	/// (total object length, reader positioned at `offset`). Lets an
+	/// interrupted download resume without refetching bytes already on disk.
+	///
+	/// Default: stream from the start and discard `offset` bytes. Correct
+	/// everywhere but saves no bandwidth - backends should override with a
+	/// real ranged read.
+	async fn get_range(&self, key: &str, offset: u64) -> Result<(u64, Reader)> {
+		use tokio::io::AsyncReadExt;
+		let (len, mut reader) = self.get_stream(key).await?;
+		let mut remaining = offset;
+		let mut scratch = vec![0u8; 64 * 1024];
+		while remaining > 0 {
+			let want = remaining.min(scratch.len() as u64) as usize;
+			let n = reader.read(&mut scratch[..want]).await?;
+			if n == 0 {
+				break;
+			}
+			remaining -= n as u64;
+		}
+		Ok((len, reader))
+	}
 }

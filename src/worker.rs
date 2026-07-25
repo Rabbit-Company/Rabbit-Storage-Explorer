@@ -56,7 +56,7 @@ pub enum Command {
 	SetSettings(Settings),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum TransferKind {
 	Upload,
 	Download,
@@ -66,6 +66,7 @@ pub enum TransferKind {
 #[derive(Clone, Debug)]
 pub struct FileProgress {
 	pub name: String,
+	pub kind: TransferKind,
 	pub done: u64,
 	pub total: u64,
 	/// Smoothed speed in bytes/second, measured worker-side over >= 1s
@@ -85,26 +86,27 @@ pub enum Event {
 		entries: Vec<RemoteEntry>,
 	},
 	ListFailed(String),
-	/// `files` is the full batch roster (also the still-queued ones), in
-	/// processing order, with `done = 0`.
 	TransferStarted {
-		#[allow(unused)]
-		kind: TransferKind,
 		total_files: u64,
 		total_bytes: u64,
 		files: Vec<FileProgress>,
+	},
+	TransferExtended {
+		total_files: u64,
+		total_bytes: u64,
+		added: Vec<FileProgress>,
 	},
 	TransferProgress {
 		done_files: u64,
 		failed_files: u64,
 		bytes_done: u64,
 		files: Vec<FileProgress>,
-		/// Set when this event marks one file as finished: (name, success).
-		finished: Option<(String, bool)>,
+		/// Set when this event marks one file as finished: (kind, name, success).
+		finished: Option<(TransferKind, String, bool)>,
 	},
 	TransferFinished {
-		kind: TransferKind,
-		done: u64,
+		uploaded: u64,
+		downloaded: u64,
 		failed: u64,
 		errors: Vec<String>,
 	},
@@ -236,18 +238,18 @@ async fn connect_backend(
 async fn dispatch(cmd_rx: async_channel::Receiver<Command>, ev: async_channel::Sender<Event>) {
 	let mut session: Option<Session> = None;
 	let mut settings = Settings::load();
-	let mut cancel = CancellationToken::new();
+	let hub = TransferHub::new(ev.clone());
 
 	while let Ok(cmd) = cmd_rx.recv().await {
 		match cmd {
 			Command::SetSettings(s) => settings = s,
 
 			Command::Disconnect => {
-				cancel.cancel();
+				hub.cancel_all();
 				session = None;
 			}
 
-			Command::CancelTransfers => cancel.cancel(),
+			Command::CancelTransfers => hub.cancel_all(),
 
 			Command::Connect {
 				profile,
@@ -294,16 +296,14 @@ async fn dispatch(cmd_rx: async_channel::Receiver<Command>, ev: async_channel::S
 
 			Command::Upload { paths, dest_prefix } => {
 				let Some(s) = session.clone() else { continue };
-				cancel = CancellationToken::new();
-				let (ev, st, tok) = (ev.clone(), settings.clone(), cancel.clone());
-				tokio::spawn(async move { run_upload(s, paths, dest_prefix, st, ev, tok).await });
+				let (hub, st) = (hub.clone(), settings.clone());
+				tokio::spawn(async move { run_upload(hub, s, paths, dest_prefix, st).await });
 			}
 
 			Command::Download { items, dest } => {
 				let Some(s) = session.clone() else { continue };
-				cancel = CancellationToken::new();
-				let (ev, st, tok) = (ev.clone(), settings.clone(), cancel.clone());
-				tokio::spawn(async move { run_download(s, items, dest, st, ev, tok).await });
+				let (hub, st) = (hub.clone(), settings.clone());
+				tokio::spawn(async move { run_download(hub, s, items, dest, st).await });
 			}
 
 			Command::CreateFolder { prefix, name } => {
@@ -459,14 +459,14 @@ fn raw_to_entry(o: RawObject, keys: Option<&VaultKeys>) -> RemoteEntry {
 
 struct Progress {
 	ev: async_channel::Sender<Event>,
-	done: AtomicU64,
+	uploaded: AtomicU64,
+	downloaded: AtomicU64,
 	failed: AtomicU64,
 	bytes: AtomicU64,
 	start: Instant,
 	/// Milliseconds (since `start`) of the last emitted byte-progress event.
 	last_emit: AtomicU64,
-	/// Currently in-flight files.
-	active: StdMutex<HashMap<String, FileTrack>>,
+	active: StdMutex<HashMap<(TransferKind, String), FileTrack>>,
 }
 
 struct FileTrack {
@@ -481,7 +481,8 @@ impl Progress {
 	fn new(ev: async_channel::Sender<Event>) -> Arc<Self> {
 		Arc::new(Self {
 			ev,
-			done: AtomicU64::new(0),
+			uploaded: AtomicU64::new(0),
+			downloaded: AtomicU64::new(0),
 			failed: AtomicU64::new(0),
 			bytes: AtomicU64::new(0),
 			start: Instant::now(),
@@ -490,9 +491,13 @@ impl Progress {
 		})
 	}
 
-	fn file_start(&self, name: &str, total: u64) {
+	fn done_files(&self) -> u64 {
+		self.uploaded.load(Ordering::Relaxed) + self.downloaded.load(Ordering::Relaxed)
+	}
+
+	fn file_start(&self, kind: TransferKind, name: &str, total: u64) {
 		self.active.lock().unwrap().insert(
-			name.to_string(),
+			(kind, name.to_string()),
 			FileTrack {
 				done: 0,
 				total,
@@ -507,44 +512,57 @@ impl Progress {
 		let map = self.active.lock().unwrap();
 		let mut v: Vec<FileProgress> = map
 			.iter()
-			.map(|(name, t)| FileProgress {
+			.map(|((kind, name), t)| FileProgress {
 				name: name.clone(),
+				kind: *kind,
 				done: t.done,
 				total: t.total,
 				speed_bps: t.speed_bps,
 			})
 			.collect();
-		v.sort_by(|a, b| a.name.cmp(&b.name)); // stable row order in the UI
+		// Stable row order: group by kind, then name.
+		v.sort_by(|a, b| (a.kind as u8, a.name.as_str()).cmp(&(b.kind as u8, b.name.as_str())));
 		v
 	}
-	async fn file_done(&self, name: &str, ok: bool) {
-		self.active.lock().unwrap().remove(name);
+
+	async fn file_done(&self, kind: TransferKind, name: &str, ok: bool) {
+		self
+			.active
+			.lock()
+			.unwrap()
+			.remove(&(kind, name.to_string()));
 		if ok {
-			self.done.fetch_add(1, Ordering::Relaxed);
+			match kind {
+				TransferKind::Upload => self.uploaded.fetch_add(1, Ordering::Relaxed),
+				TransferKind::Download => self.downloaded.fetch_add(1, Ordering::Relaxed),
+			};
 		} else {
 			self.failed.fetch_add(1, Ordering::Relaxed);
 		}
 		let _ = self
 			.ev
 			.send(Event::TransferProgress {
-				done_files: self.done.load(Ordering::Relaxed),
+				done_files: self.done_files(),
 				failed_files: self.failed.load(Ordering::Relaxed),
 				bytes_done: self.bytes.load(Ordering::Relaxed),
 				files: self.snapshot(),
-				finished: Some((name.to_string(), ok)),
+				finished: Some((kind, name.to_string(), ok)),
 			})
 			.await;
 	}
+
 	/// Record transferred bytes and emit a progress event, throttled to at
-	/// most ~10 events/second so large files show a live progress bar without
-	/// flooding the UI channel.
-	fn tick(&self, current: &str, n: u64) {
+	/// most ~10 events/second.
+	fn tick(&self, kind: TransferKind, current: &str, n: u64) {
 		self.bytes.fetch_add(n, Ordering::Relaxed);
-		if let Some(entry) = self.active.lock().unwrap().get_mut(current) {
+		if let Some(entry) = self
+			.active
+			.lock()
+			.unwrap()
+			.get_mut(&(kind, current.to_string()))
+		{
 			entry.done += n;
 			entry.window_bytes += n;
-			// Chunk arrivals are bursty; averaging over at least a second
-			// gives a rate that sums correctly across parallel files.
 			let elapsed = entry.window_start.elapsed().as_secs_f64();
 			if elapsed >= 1.0 {
 				let instant_bps = entry.window_bytes as f64 / elapsed;
@@ -565,14 +583,141 @@ impl Progress {
 				.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
 				.is_ok()
 		{
-			// Unbounded channel: send_blocking never actually blocks.
 			let _ = self.ev.send_blocking(Event::TransferProgress {
-				done_files: self.done.load(Ordering::Relaxed),
+				done_files: self.done_files(),
 				failed_files: self.failed.load(Ordering::Relaxed),
 				bytes_done: self.bytes.load(Ordering::Relaxed),
 				files: self.snapshot(),
 				finished: None,
 			});
+		}
+	}
+
+	fn file_resume(&self, kind: TransferKind, name: &str, total: u64, already_done: u64) {
+		self.active.lock().unwrap().insert(
+			(kind, name.to_string()),
+			FileTrack {
+				done: already_done,
+				total,
+				speed_bps: 0.0,
+				window_start: Instant::now(),
+				window_bytes: 0,
+			},
+		);
+	}
+}
+
+struct BatchState {
+	open: bool,
+	outstanding: u64,
+	total_files: u64,
+	total_bytes: u64,
+	progress: Arc<Progress>,
+	errors: Arc<tokio::sync::Mutex<Vec<String>>>,
+	upload_sem: Arc<Semaphore>,
+	download_sem: Arc<Semaphore>,
+	cancel: CancellationToken,
+}
+
+/// Handles handed to a file task when its files are admitted to the batch.
+struct Admission {
+	progress: Arc<Progress>,
+	errors: Arc<tokio::sync::Mutex<Vec<String>>>,
+	upload_sem: Arc<Semaphore>,
+	download_sem: Arc<Semaphore>,
+	cancel: CancellationToken,
+	fresh: bool,
+	total_files: u64,
+	total_bytes: u64,
+}
+
+/// Owns the single live transfer batch. Uploads and downloads share it, so
+/// dropping more files while a transfer runs extends the same batch (and the
+/// same progress bar) instead of starting a competing one.
+struct TransferHub {
+	ev: async_channel::Sender<Event>,
+	state: StdMutex<BatchState>,
+}
+
+impl TransferHub {
+	fn new(ev: async_channel::Sender<Event>) -> Arc<Self> {
+		let state = BatchState {
+			open: false,
+			outstanding: 0,
+			total_files: 0,
+			total_bytes: 0,
+			progress: Progress::new(ev.clone()),
+			errors: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+			upload_sem: Arc::new(Semaphore::new(1)),
+			download_sem: Arc::new(Semaphore::new(1)),
+			cancel: CancellationToken::new(),
+		};
+		Arc::new(Self {
+			ev,
+			state: StdMutex::new(state),
+		})
+	}
+
+	fn cancel_all(&self) {
+		self.state.lock().unwrap().cancel.cancel();
+	}
+
+	/// Register `count` files (`bytes` total) into the running batch, opening a
+	/// fresh one if none is live. The fresh/extend decision and the outstanding
+	/// bump happen under one lock, so a late merge can never race the drain.
+	fn admit(&self, settings: &Settings, count: u64, bytes: u64) -> Admission {
+		let mut st = self.state.lock().unwrap();
+		let fresh = !st.open;
+		if fresh {
+			st.open = true;
+			st.outstanding = 0;
+			st.total_files = 0;
+			st.total_bytes = 0;
+			st.progress = Progress::new(self.ev.clone());
+			st.errors = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+			st.upload_sem = Arc::new(Semaphore::new(settings.upload_parallelism.max(1)));
+			st.download_sem = Arc::new(Semaphore::new(settings.download_parallelism.max(1)));
+			st.cancel = CancellationToken::new();
+		}
+		st.outstanding += count;
+		st.total_files += count;
+		st.total_bytes += bytes;
+		Admission {
+			progress: st.progress.clone(),
+			errors: st.errors.clone(),
+			upload_sem: st.upload_sem.clone(),
+			download_sem: st.download_sem.clone(),
+			cancel: st.cancel.clone(),
+			fresh,
+			total_files: st.total_files,
+			total_bytes: st.total_bytes,
+		}
+	}
+
+	/// One file task finished. Emits `TransferFinished` when the batch drains.
+	async fn task_done(&self) {
+		let finished = {
+			let mut st = self.state.lock().unwrap();
+			st.outstanding = st.outstanding.saturating_sub(1);
+			if st.open && st.outstanding == 0 {
+				st.open = false;
+				Some((st.progress.clone(), st.errors.clone()))
+			} else {
+				None
+			}
+		};
+		if let Some((progress, errors)) = finished {
+			let mut errs = errors.lock().await.clone();
+			errs.truncate(20);
+			let _ = self
+				.ev
+				.send(Event::TransferFinished {
+					uploaded: progress.uploaded.load(Ordering::Relaxed),
+					downloaded: progress.downloaded.load(Ordering::Relaxed),
+					failed: progress.failed.load(Ordering::Relaxed),
+					errors: errs,
+				})
+				.await;
 		}
 	}
 }
@@ -612,15 +757,13 @@ fn path_to_key(rel: &std::path::Path) -> String {
 }
 
 async fn run_upload(
+	hub: Arc<TransferHub>,
 	s: Session,
 	paths: Vec<PathBuf>,
 	dest_prefix: String,
 	st: Settings,
-	ev: async_channel::Sender<Event>,
-	cancel: CancellationToken,
 ) {
-	// Directory walking and metadata scans are blocking I/O - keep them off
-	// the async workers.
+	let ev = hub.ev.clone();
 	let files = tokio::task::spawn_blocking(move || expand_paths(&paths))
 		.await
 		.unwrap_or_default();
@@ -633,66 +776,57 @@ async fn run_upload(
 		.iter()
 		.map(|(_, rel, size)| FileProgress {
 			name: rel.clone(),
+			kind: TransferKind::Upload,
 			done: 0,
 			total: *size,
 			speed_bps: 0.0,
 		})
 		.collect();
+
+	let a = hub.admit(&st, files.len() as u64, total_bytes);
 	let _ = ev
-		.send(Event::TransferStarted {
-			kind: TransferKind::Upload,
-			total_files: files.len() as u64,
-			total_bytes,
-			files: roster,
+		.send(if a.fresh {
+			Event::TransferStarted {
+				total_files: a.total_files,
+				total_bytes: a.total_bytes,
+				files: roster,
+			}
+		} else {
+			Event::TransferExtended {
+				total_files: a.total_files,
+				total_bytes: a.total_bytes,
+				added: roster,
+			}
 		})
 		.await;
-
-	let progress = Progress::new(ev.clone());
-	let sem = Arc::new(Semaphore::new(st.upload_parallelism.max(1)));
-	let errors = Arc::new(tokio::sync::Mutex::new(Vec::<String>::new()));
-	let mut handles = Vec::with_capacity(files.len());
 
 	for (path, rel, _size) in files {
-		let (s, st, sem, progress, errors, cancel) = (
+		let (s, st, sem, progress, errors, cancel, hub) = (
 			s.clone(),
 			st.clone(),
-			sem.clone(),
-			progress.clone(),
-			errors.clone(),
-			cancel.clone(),
+			a.upload_sem.clone(),
+			a.progress.clone(),
+			a.errors.clone(),
+			a.cancel.clone(),
+			hub.clone(),
 		);
 		let dest_prefix = dest_prefix.clone();
-		handles.push(tokio::spawn(async move {
+		tokio::spawn(async move {
 			let _permit = sem.acquire_owned().await.ok();
-			if cancel.is_cancelled() {
-				return;
-			}
-			let result = upload_one(&s, &st, &path, &dest_prefix, &rel, &progress, &cancel).await;
-			match result {
-				Ok(()) => progress.file_done(&rel, true).await,
-				Err(e) => {
-					if !cancel.is_cancelled() {
-						errors.lock().await.push(format!("{rel}: {e:#}"));
+			if !cancel.is_cancelled() {
+				match upload_one(&s, &st, &path, &dest_prefix, &rel, &progress, &cancel).await {
+					Ok(()) => progress.file_done(TransferKind::Upload, &rel, true).await,
+					Err(e) => {
+						if !cancel.is_cancelled() {
+							errors.lock().await.push(format!("{rel}: {e:#}"));
+						}
+						progress.file_done(TransferKind::Upload, &rel, false).await;
 					}
-					progress.file_done(&rel, false).await;
 				}
 			}
-		}));
+			hub.task_done().await;
+		});
 	}
-	for h in handles {
-		let _ = h.await;
-	}
-
-	let mut errs = errors.lock().await.clone();
-	errs.truncate(20); // don't flood the UI with 5000 identical errors
-	let _ = ev
-		.send(Event::TransferFinished {
-			kind: TransferKind::Upload,
-			done: progress.done.load(Ordering::Relaxed),
-			failed: progress.failed.load(Ordering::Relaxed),
-			errors: errs,
-		})
-		.await;
 }
 
 async fn upload_one(
@@ -717,10 +851,7 @@ async fn upload_one(
 		if cancel.is_cancelled() {
 			return Err(anyhow!("cancelled"));
 		}
-		progress.file_start(rel, plain_len); // (re)sets the per-file tracker on retries
-																			 // Snapshot the backend for the whole attempt: an SFTP multipart write
-																			 // must stay on the instance that holds its file handle, even if a
-																			 // reconnect swaps the session backend mid-transfer.
+		progress.file_start(TransferKind::Upload, rel, plain_len);
 		let result = async {
 			let backend = s.backend().await;
 			backend.prepare_parents(&key).await?;
@@ -758,7 +889,7 @@ async fn upload_small(
 		None => data,
 	};
 	backend.put(key, body).await?;
-	progress.tick(name, plain_len);
+	progress.tick(TransferKind::Upload, name, plain_len);
 	Ok(())
 }
 
@@ -812,7 +943,7 @@ async fn upload_multipart(
 				Some(enc) => part_buf.extend(enc.seal_chunk(&chunk[..filled], last)?),
 				None => part_buf.extend_from_slice(&chunk[..filled]),
 			}
-			progress.tick(name, filled as u64);
+			progress.tick(TransferKind::Upload, name, filled as u64);
 
 			if part_buf.len() >= part_size || last {
 				let data = std::mem::take(&mut part_buf);
@@ -835,20 +966,23 @@ async fn upload_multipart(
 }
 
 async fn run_download(
+	hub: Arc<TransferHub>,
 	s: Session,
 	items: Vec<RemoteEntry>,
 	dest: PathBuf,
 	st: Settings,
-	ev: async_channel::Sender<Event>,
-	cancel: CancellationToken,
 ) {
-	// Resolve folders into concrete (key, relative display path) targets.
-	let mut targets: Vec<(String, String, u64)> = Vec::new(); // (key, rel display path, cipher size)
+	let ev = hub.ev.clone();
+	// Short-lived token just for the recursive-listing heal path below; the
+	// real per-file cancel comes from admit().
+	let precancel = CancellationToken::new();
+
+	let mut targets: Vec<(String, String, u64)> = Vec::new();
 	for item in &items {
 		if item.is_dir {
 			let mut listing = s.backend().await.list_recursive(&item.key).await;
 			if listing.is_err() {
-				s.wait_until_healthy(&cancel).await;
+				s.wait_until_healthy(&precancel).await;
 				listing = s.backend().await.list_recursive(&item.key).await;
 			}
 			match listing {
@@ -880,80 +1014,74 @@ async fn run_download(
 		.iter()
 		.map(|(_, rel, size)| FileProgress {
 			name: rel.clone(),
+			kind: TransferKind::Download,
 			done: 0,
 			total: *size,
 			speed_bps: 0.0,
 		})
 		.collect();
+
+	let a = hub.admit(&st, targets.len() as u64, total_bytes);
 	let _ = ev
-		.send(Event::TransferStarted {
-			kind: TransferKind::Download,
-			total_files: targets.len() as u64,
-			total_bytes,
-			files: roster,
+		.send(if a.fresh {
+			Event::TransferStarted {
+				total_files: a.total_files,
+				total_bytes: a.total_bytes,
+				files: roster,
+			}
+		} else {
+			Event::TransferExtended {
+				total_files: a.total_files,
+				total_bytes: a.total_bytes,
+				added: roster,
+			}
 		})
 		.await;
-
-	let progress = Progress::new(ev.clone());
-	let sem = Arc::new(Semaphore::new(st.download_parallelism.max(1)));
-	let errors = Arc::new(tokio::sync::Mutex::new(Vec::<String>::new()));
-	let mut handles = Vec::with_capacity(targets.len());
 
 	for (key, rel, size) in targets {
-		let (s, st, sem, progress, errors, cancel, dest) = (
+		let (s, st, sem, progress, errors, cancel, dest, hub) = (
 			s.clone(),
 			st.clone(),
-			sem.clone(),
-			progress.clone(),
-			errors.clone(),
-			cancel.clone(),
+			a.download_sem.clone(),
+			a.progress.clone(),
+			a.errors.clone(),
+			a.cancel.clone(),
 			dest.clone(),
+			hub.clone(),
 		);
-		handles.push(tokio::spawn(async move {
+		tokio::spawn(async move {
 			let _permit = sem.acquire_owned().await.ok();
-			if cancel.is_cancelled() {
-				return;
-			}
-			let out_path = dest.join(sanitize_rel(&rel));
-			let mut attempt = 0u32;
-			let result = loop {
-				progress.file_start(&rel, size); // (re)sets the per-file tracker on retries
-				let r = download_one(&s, &key, &rel, &out_path, &progress, &cancel).await;
-				match r {
-					Ok(()) => break Ok(()),
-					Err(_) if attempt < st.retries && !cancel.is_cancelled() => {
-						attempt += 1;
-						s.wait_until_healthy(&cancel).await;
-						tokio::time::sleep(Duration::from_millis(400 * (1 << attempt.min(4)))).await;
+			if !cancel.is_cancelled() {
+				let out_path = dest.join(sanitize_rel(&rel));
+				let mut attempt = 0u32;
+				let result = loop {
+					match download_one(&s, &key, &rel, size, &out_path, &progress, &cancel).await {
+						Ok(()) => break Ok(()),
+						Err(_) if attempt < st.retries && !cancel.is_cancelled() => {
+							attempt += 1;
+							s.wait_until_healthy(&cancel).await;
+							tokio::time::sleep(Duration::from_millis(400 * (1 << attempt.min(4)))).await;
+						}
+						Err(e) => break Err(e),
 					}
-					Err(e) => break Err(e),
-				}
-			};
-			match result {
-				Ok(()) => progress.file_done(&rel, true).await,
-				Err(e) => {
-					if !cancel.is_cancelled() {
-						errors.lock().await.push(format!("{rel}: {e:#}"));
+				};
+				match result {
+					Ok(()) => progress.file_done(TransferKind::Download, &rel, true).await,
+					Err(e) => {
+						// Gave up (or cancelled): don't leave a stray .rse-part.
+						let _ = tokio::fs::remove_file(part_path(&out_path)).await;
+						if !cancel.is_cancelled() {
+							errors.lock().await.push(format!("{rel}: {e:#}"));
+						}
+						progress
+							.file_done(TransferKind::Download, &rel, false)
+							.await;
 					}
-					progress.file_done(&rel, false).await;
 				}
 			}
-		}));
+			hub.task_done().await;
+		});
 	}
-	for h in handles {
-		let _ = h.await;
-	}
-
-	let mut errs = errors.lock().await.clone();
-	errs.truncate(20);
-	let _ = ev
-		.send(Event::TransferFinished {
-			kind: TransferKind::Download,
-			done: progress.done.load(Ordering::Relaxed),
-			failed: progress.failed.load(Ordering::Relaxed),
-			errors: errs,
-		})
-		.await;
 }
 
 /// A read that makes no progress for two minutes means the connection is
@@ -965,10 +1093,22 @@ async fn read_or_stall<T>(fut: impl std::future::Future<Output = std::io::Result
 		.map_err(Into::into)
 }
 
+fn part_path(out_path: &std::path::Path) -> PathBuf {
+	let tmp_name = format!(
+		"{}.rse-part",
+		out_path
+			.file_name()
+			.and_then(|n| n.to_str())
+			.unwrap_or("download")
+	);
+	out_path.with_file_name(tmp_name)
+}
+
 async fn download_one(
 	s: &Session,
 	key: &str,
 	name: &str,
+	expected_len: u64,
 	out_path: &PathBuf,
 	progress: &Progress,
 	cancel: &CancellationToken,
@@ -979,24 +1119,80 @@ async fn download_one(
 	if let Some(parent) = out_path.parent() {
 		tokio::fs::create_dir_all(parent).await?;
 	}
-	let (len, mut reader) = s.backend().await.get_stream(key).await?;
-	let tmp_name = format!(
-		"{}.rse-part",
-		out_path
-			.file_name()
-			.and_then(|n| n.to_str())
-			.unwrap_or("download")
-	);
-	let tmp = out_path.with_file_name(tmp_name);
-	let mut file = tokio::fs::File::create(&tmp).await?;
+	let tmp = part_path(out_path);
+	let encrypted = s.keys.is_some();
+
+	// How much is already on disk (plaintext bytes)?
+	let mut done_plain: u64 = tokio::fs::metadata(&tmp)
+		.await
+		.map(|m| m.len())
+		.unwrap_or(0);
+
+	// Encrypted resume only lands on a whole-chunk boundary; drop any
+	// half-written trailing chunk so we never resume mid-frame.
+	if encrypted && done_plain > 0 {
+		let whole = done_plain - (done_plain % crypto::CHUNK as u64);
+		if whole != done_plain {
+			let f = tokio::fs::OpenOptions::new().write(true).open(&tmp).await?;
+			f.set_len(whole).await?;
+			done_plain = whole;
+		}
+	}
+
+	// Plaintext size, for the completion check and the progress row total.
+	let plaintext_total = if encrypted {
+		let (n_chunks, _last) = crypto::chunk_layout(expected_len)?;
+		expected_len
+			.saturating_sub(crypto::HEADER_LEN as u64)
+			.saturating_sub(n_chunks * crypto::TAG as u64)
+	} else {
+		expected_len
+	};
+
+	// Already complete (e.g. crashed between flush and rename): just finalize.
+	if done_plain > 0 && done_plain >= plaintext_total {
+		if let Ok(m) = tokio::fs::metadata(&tmp).await {
+			if m.len() > plaintext_total {
+				let f = tokio::fs::OpenOptions::new().write(true).open(&tmp).await?;
+				f.set_len(plaintext_total).await?;
+			}
+		}
+		tokio::fs::rename(&tmp, out_path).await?;
+		return Ok(());
+	}
+
+	// Ciphertext offset to resume the network read from.
+	let cipher_off = if encrypted {
+		let completed = done_plain / crypto::CHUNK as u64;
+		crypto::HEADER_LEN as u64 + completed * crypto::CIPHER_CHUNK as u64
+	} else {
+		done_plain
+	};
+
+	let (_len, mut reader) = if done_plain > 0 {
+		s.backend().await.get_range(key, cipher_off).await?
+	} else {
+		s.backend().await.get_stream(key).await?
+	};
+
+	let mut file = tokio::fs::OpenOptions::new()
+		.create(true)
+		.write(true)
+		.append(true)
+		.open(&tmp)
+		.await?;
+
+	if done_plain > 0 {
+		progress.file_resume(TransferKind::Download, name, plaintext_total, done_plain);
+	} else {
+		progress.file_start(TransferKind::Download, name, plaintext_total);
+	}
 
 	let result: Result<()> = async {
 		match s.keys.as_deref() {
 			None => {
 				let mut buf = vec![0u8; 256 * 1024];
 				loop {
-					// select! so a read blocked on a dead-slow network also
-					// aborts the instant Cancel is pressed, not just between reads.
 					let n = tokio::select! {
 						biased;
 						_ = cancel.cancelled() => return Err(anyhow!("cancelled")),
@@ -1006,19 +1202,32 @@ async fn download_one(
 						break;
 					}
 					file.write_all(&buf[..n]).await?;
-					progress.tick(name, n as u64);
+					progress.tick(TransferKind::Download, name, n as u64);
 				}
 				file.flush().await?;
 			}
 			Some(keys) => {
-				let (n_chunks, last_len) = crypto::chunk_layout(len)?;
+				let (n_chunks, last_len) = crypto::chunk_layout(expected_len)?;
+				let completed = done_plain / crypto::CHUNK as u64;
+
+				// The file nonce lives in the 12-byte header. When resuming we
+				// skipped it, so fetch just those bytes to rebuild the decryptor.
 				let mut header = [0u8; crypto::HEADER_LEN];
-				read_or_stall(reader.read_exact(&mut header))
-					.await
-					.context("reading header")?;
+				if completed == 0 {
+					read_or_stall(reader.read_exact(&mut header))
+						.await
+						.context("reading header")?;
+				} else {
+					let (_h, mut h_reader) = s.backend().await.get_range(key, 0).await?;
+					read_or_stall(h_reader.read_exact(&mut header))
+						.await
+						.context("reading header")?;
+				}
 				let mut dec = crypto::Decryptor::new(keys, &header)?;
+				dec.seek_to(completed as u32);
+
 				let mut buf = vec![0u8; crypto::CIPHER_CHUNK];
-				for i in 0..n_chunks {
+				for i in completed..n_chunks {
 					let last = i == n_chunks - 1;
 					let clen = if last { last_len } else { crypto::CIPHER_CHUNK };
 					tokio::select! {
@@ -1030,7 +1239,7 @@ async fn download_one(
 					}
 					let plain = dec.open_chunk(&buf[..clen], last)?;
 					file.write_all(&plain).await?;
-					progress.tick(name, plain.len() as u64);
+					progress.tick(TransferKind::Download, name, plain.len() as u64);
 				}
 				file.flush().await?;
 			}
@@ -1042,9 +1251,9 @@ async fn download_one(
 	drop(file);
 	if result.is_ok() {
 		tokio::fs::rename(&tmp, out_path).await?;
-	} else {
-		let _ = tokio::fs::remove_file(&tmp).await; // partial .rse-part is cleaned up
 	}
+	// On failure the .rse-part is deliberately left in place so the next
+	// attempt resumes from it. The caller removes it only when it gives up.
 	result
 }
 

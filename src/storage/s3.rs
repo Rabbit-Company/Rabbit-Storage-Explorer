@@ -342,4 +342,24 @@ impl StorageBackend for S3Backend {
 		}
 		Ok(())
 	}
+
+	async fn get_range(&self, key: &str, offset: u64) -> Result<(u64, Reader)> {
+		if offset == 0 {
+			return self.get_stream(key).await;
+		}
+		let out = self
+			.client
+			.get_object()
+			.bucket(&self.bucket)
+			.key(key)
+			.range(format!("bytes={offset}-"))
+			.send()
+			.await
+			.with_context(|| format!("ranged download failed: {key}"))?;
+		// A 206 reports only the remaining length; add back the offset.
+		let remaining = out.content_length().unwrap_or(0).max(0) as u64;
+		let total = offset + remaining;
+		let body = out.body.into_async_read();
+		Ok((total, Box::pin(body)))
+	}
 }

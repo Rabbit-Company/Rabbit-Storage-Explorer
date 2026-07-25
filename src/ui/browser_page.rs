@@ -3,7 +3,7 @@
 
 use super::{human_eta, human_size, human_time};
 use crate::storage::RemoteEntry;
-use crate::worker::{Command, FileProgress};
+use crate::worker::{Command, FileProgress, TransferKind};
 use adw::prelude::*;
 use gtk::{gdk, gio, glib};
 use std::cell::{Cell, RefCell};
@@ -19,15 +19,13 @@ enum ItemState {
 	Failed,
 }
 
-/// One row in the transfers dialog. Stored in a persistent `gio::ListStore`
-/// and updated in place, so the dialog's scroll position survives updates.
 #[derive(Clone)]
 struct TransferItem {
 	name: String,
+	kind: TransferKind,
 	total: u64,
 	done: u64,
 	state: ItemState,
-	/// Bytes/second, measured by the worker.
 	speed_bps: f64,
 }
 
@@ -61,7 +59,7 @@ pub struct BrowserPage {
 	/// Rows of the transfers dialog; persists across dialog open/close.
 	transfer_store: gio::ListStore,
 	/// name -> position in `transfer_store`.
-	transfer_index: RefCell<HashMap<String, u32>>,
+	transfer_index: RefCell<HashMap<(TransferKind, String), u32>>,
 	bytes_done: Cell<u64>,
 	/// Sum of the active files' speeds, bytes/second.
 	global_speed_bps: Cell<f64>,
@@ -740,22 +738,37 @@ impl BrowserPage {
 		self.bar_progress.remove_css_class("stalled");
 
 		self.transfer_store.remove_all();
+		self.transfer_index.borrow_mut().clear();
+		self.append_transfer_rows(files);
+		self.update_stats_widgets();
+		self.bar.set_reveal_child(true);
+	}
+
+	pub fn transfer_extended(&self, total_files: u64, total_bytes: u64, added: Vec<FileProgress>) {
+		self.total_files.set(total_files);
+		self.total_bytes.set(total_bytes);
+		self.transferring.set(true);
+		self.append_transfer_rows(added);
+		self.update_stats_widgets();
+		self.bar.set_reveal_child(true);
+	}
+
+	fn append_transfer_rows(&self, files: Vec<FileProgress>) {
 		let mut index = self.transfer_index.borrow_mut();
-		index.clear();
-		for (i, f) in files.into_iter().enumerate() {
-			index.insert(f.name.clone(), i as u32);
+		for f in files {
+			let pos = self.transfer_store.n_items();
+			index.insert((f.kind, f.name.clone()), pos);
 			self
 				.transfer_store
 				.append(&glib::BoxedAnyObject::new(TransferItem {
 					name: f.name,
+					kind: f.kind,
 					total: f.total,
 					done: 0,
 					state: ItemState::Queued,
 					speed_bps: 0.0,
 				}));
 		}
-		self.update_stats_widgets();
-		self.bar.set_reveal_child(true);
 	}
 
 	pub fn transfer_progress(
@@ -764,7 +777,7 @@ impl BrowserPage {
 		failed: u64,
 		bytes: u64,
 		files: Vec<FileProgress>,
-		finished: Option<(String, bool)>,
+		finished: Option<(TransferKind, String, bool)>,
 	) {
 		self.last_progress.set(std::time::Instant::now());
 		if self.stalled.get() {
@@ -789,14 +802,14 @@ impl BrowserPage {
 		self.update_stats_widgets();
 
 		for f in files {
-			self.update_transfer_item(&f.name, |item| {
+			self.update_transfer_item(f.kind, &f.name, |item| {
 				item.done = f.done;
 				item.speed_bps = f.speed_bps;
 				item.state = ItemState::Active;
 			});
 		}
-		if let Some((name, ok)) = finished {
-			self.update_transfer_item(&name, |item| {
+		if let Some((kind, name, ok)) = finished {
+			self.update_transfer_item(kind, &name, |item| {
 				item.state = if ok {
 					ItemState::Done
 				} else {
@@ -892,10 +905,18 @@ impl BrowserPage {
 		self.update_stats_widgets();
 	}
 
-	/// Replace one row's data in place. The splice keeps the row position, so
-	/// an open dialog updates without losing the user's scroll position.
-	fn update_transfer_item(&self, name: &str, apply: impl FnOnce(&mut TransferItem)) {
-		let Some(pos) = self.transfer_index.borrow().get(name).copied() else {
+	fn update_transfer_item(
+		&self,
+		kind: TransferKind,
+		name: &str,
+		apply: impl FnOnce(&mut TransferItem),
+	) {
+		let Some(pos) = self
+			.transfer_index
+			.borrow()
+			.get(&(kind, name.to_string()))
+			.copied()
+		else {
 			return;
 		};
 		let Some(obj) = self
@@ -924,9 +945,16 @@ impl BrowserPage {
 			status.set_xalign(0.0);
 			status.add_css_class("caption");
 			status.add_css_class("numeric");
+
+			let kind_icon = gtk::Image::new();
 			let name = gtk::Label::new(None);
 			name.set_xalign(0.0);
+			name.set_hexpand(true);
 			name.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+			let name_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+			name_row.append(&kind_icon);
+			name_row.append(&name);
+
 			let bar = gtk::ProgressBar::new();
 			bar.set_show_text(true);
 			let row = gtk::Box::new(gtk::Orientation::Vertical, 4);
@@ -935,7 +963,7 @@ impl BrowserPage {
 			row.set_margin_top(8);
 			row.set_margin_bottom(8);
 			row.append(&status);
-			row.append(&name);
+			row.append(&name_row);
 			row.append(&bar);
 			item.set_child(Some(&row));
 		});
@@ -947,11 +975,23 @@ impl BrowserPage {
 			let data = obj.borrow::<TransferItem>();
 			let row = item.child().and_downcast::<gtk::Box>().unwrap();
 			let status = row.first_child().and_downcast::<gtk::Label>().unwrap();
-			let name = status.next_sibling().and_downcast::<gtk::Label>().unwrap();
+			let name_row = status.next_sibling().and_downcast::<gtk::Box>().unwrap();
+			let kind_icon = name_row.first_child().and_downcast::<gtk::Image>().unwrap();
+			let name = kind_icon
+				.next_sibling()
+				.and_downcast::<gtk::Label>()
+				.unwrap();
 			let bar = row.last_child().and_downcast::<gtk::ProgressBar>().unwrap();
 
 			name.set_text(&data.name);
 			name.set_tooltip_text(Some(&data.name));
+
+			let (icon_name, tip) = match data.kind {
+				TransferKind::Upload => ("document-send-symbolic", "Uploading"),
+				TransferKind::Download => ("folder-download-symbolic", "Downloading"),
+			};
+			kind_icon.set_icon_name(Some(icon_name));
+			kind_icon.set_tooltip_text(Some(tip));
 
 			for class in ["dim-label", "success", "error"] {
 				status.remove_css_class(class);

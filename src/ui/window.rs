@@ -6,7 +6,7 @@ use super::browser_page::BrowserPage;
 use super::connection_page::ConnectionPage;
 use super::settings_dialog;
 use crate::settings::Settings;
-use crate::worker::{self, Command, Event, TransferKind};
+use crate::worker::{self, Command, Event};
 use adw::prelude::*;
 use gtk::glib;
 use std::cell::RefCell;
@@ -114,12 +114,18 @@ pub fn build(app: &adw::Application) {
 						toast(&msg);
 					}
 					Event::TransferStarted {
-						kind: _,
 						total_files,
 						total_bytes,
 						files,
 					} => {
 						browser.transfer_started(total_files, total_bytes, files);
+					}
+					Event::TransferExtended {
+						total_files,
+						total_bytes,
+						added,
+					} => {
+						browser.transfer_extended(total_files, total_bytes, added);
 					}
 					Event::TransferProgress {
 						done_files,
@@ -131,19 +137,25 @@ pub fn build(app: &adw::Application) {
 						browser.transfer_progress(done_files, failed_files, bytes_done, files, finished);
 					}
 					Event::TransferFinished {
-						kind,
-						done,
+						uploaded,
+						downloaded,
 						failed,
 						errors,
 					} => {
 						browser.transfer_finished();
-						let verb = match kind {
-							TransferKind::Upload => "Uploaded",
-							TransferKind::Download => "Downloaded",
-						};
-						let mut msg = format!("{verb} {done} file(s)");
+						let mut parts = Vec::new();
+						if uploaded > 0 {
+							parts.push(format!("Uploaded {uploaded} file(s)"));
+						}
+						if downloaded > 0 {
+							parts.push(format!("Downloaded {downloaded} file(s)"));
+						}
+						if parts.is_empty() {
+							parts.push("Transfer complete".to_string());
+						}
+						let mut msg = parts.join(" · ");
 						if failed > 0 {
-							msg.push_str(&format!(", {failed} failed"));
+							msg.push_str(&format!(" · {failed} failed"));
 						}
 						toast(&msg);
 						if let Some(first) = errors.first() {

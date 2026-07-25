@@ -604,4 +604,49 @@ impl StorageBackend for NfsBackend {
 		}
 		Ok(())
 	}
+
+	async fn get_range(&self, key: &str, offset: u64) -> Result<(u64, Reader)> {
+		let Some((fh, size)) = self.file_handle(key).await? else {
+			bail!("download failed: {key} not found");
+		};
+		let (tx, rx) = tokio::sync::mpsc::channel::<std::io::Result<Vec<u8>>>(4);
+		let conn_arc = self.conn.clone();
+		tokio::spawn(async move {
+			let mut offset = offset.min(size); // resume point (param shadows here)
+			loop {
+				let chunk = {
+					let mut conn = conn_arc.lock().await;
+					conn
+						.nfs3_client
+						.read(&READ3args {
+							file: fh.clone(),
+							offset,
+							count: READ_CHUNK,
+						})
+						.await
+				};
+				let result = match chunk {
+					Ok(Nfs3Result::Ok(ok)) => {
+						offset += ok.count as u64;
+						let eof = ok.eof;
+						let data = ok.data.to_vec();
+						if tx.send(Ok(data)).await.is_err() {
+							return; // reader dropped
+						}
+						if eof {
+							return;
+						}
+						continue;
+					}
+					Ok(Nfs3Result::Err((stat, _))) => {
+						Err(std::io::Error::other(format!("NFS read error: {stat:?}")))
+					}
+					Err(e) => Err(std::io::Error::other(format!("NFS read failed: {e}"))),
+				};
+				let _ = tx.send(result).await;
+				return;
+			}
+		});
+		Ok((size, Box::pin(ChannelReader::new(rx))))
+	}
 }

@@ -398,4 +398,38 @@ impl StorageBackend for SmbBackend {
 		}
 		Ok(())
 	}
+
+	async fn get_range(&self, key: &str, offset: u64) -> Result<(u64, Reader)> {
+		let path = self.full(key);
+		let reader = {
+			let (client, tree) = &mut *self.inner.lock().await;
+			client
+				.open_file_reader(tree, &path)
+				.await
+				.with_context(|| format!("download failed: {key}"))?
+		};
+		let len = reader.size();
+		let (tx, rx) = tokio::sync::mpsc::channel::<std::io::Result<Vec<u8>>>(4);
+		tokio::spawn(async move {
+			let mut off = offset.min(len);
+			while off < len {
+				let want = STREAM_CHUNK.min(len - off);
+				match reader.read_at(off, want).await {
+					Ok(chunk) if chunk.is_empty() => break,
+					Ok(chunk) => {
+						off += chunk.len() as u64;
+						if tx.send(Ok(chunk)).await.is_err() {
+							break;
+						}
+					}
+					Err(e) => {
+						let _ = tx.send(Err(std::io::Error::other(e.to_string()))).await;
+						break;
+					}
+				}
+			}
+			reader.close().await.ok();
+		});
+		Ok((len, Box::pin(ChannelReader::new(rx))))
+	}
 }

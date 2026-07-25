@@ -498,6 +498,27 @@ impl StorageBackend for SftpBackend {
 		Ok(())
 	}
 
+	async fn get_range(&self, key: &str, offset: u64) -> Result<(u64, Reader)> {
+		with_timeout(60, async {
+			let full = self.full(key);
+			let mut file = self
+				.sftp
+				.open_with_flags(&full, OpenFlags::READ)
+				.await
+				.with_context(|| format!("download failed: {key}"))?;
+			let len = file.metadata().await.ok().and_then(|m| m.size).unwrap_or(0);
+			if offset > 0 {
+				use tokio::io::AsyncSeekExt;
+				file
+					.seek(std::io::SeekFrom::Start(offset))
+					.await
+					.with_context(|| format!("seek failed: {key}"))?;
+			}
+			Ok((len, Box::pin(file) as Reader))
+		})
+		.await
+	}
+
 	async fn get_vault(&self) -> Result<Option<Vec<u8>>> {
 		with_timeout(60, async {
 			match self
