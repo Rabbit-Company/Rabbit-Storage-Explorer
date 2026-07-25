@@ -55,6 +55,7 @@ pub struct BrowserPage {
 
 	bar: gtk::Revealer,
 	bar_progress: gtk::ProgressBar,
+	bar_percent: gtk::Label,
 	total_files: Cell<u64>,
 	total_bytes: Cell<u64>,
 	/// Rows of the transfers dialog; persists across dialog open/close.
@@ -164,12 +165,19 @@ impl BrowserPage {
 		empty.set_visible(false);
 		empty.set_vexpand(true);
 
-		// Just a full-width bar and a cancel button; no shifting labels.
+		// Full-width bar, a fixed-width percentage, then Cancel.
 		// Clicking the bar opens the per-file details dialog.
 		let bar_progress = gtk::ProgressBar::new();
 		bar_progress.set_hexpand(true);
 		bar_progress.set_valign(gtk::Align::Center);
 		bar_progress.set_tooltip_text(Some("Click for per-file progress"));
+
+		let bar_percent = gtk::Label::new(Some("0.00%"));
+		bar_percent.set_valign(gtk::Align::Center);
+		bar_percent.add_css_class("numeric");
+		bar_percent.set_width_chars(7);
+		bar_percent.set_xalign(1.0);
+
 		let btn_cancel = gtk::Button::with_label("Cancel");
 		btn_cancel.add_css_class("destructive-action");
 
@@ -179,6 +187,7 @@ impl BrowserPage {
 		bar_box.set_margin_top(6);
 		bar_box.set_margin_bottom(6);
 		bar_box.append(&bar_progress);
+		bar_box.append(&bar_percent);
 		bar_box.append(&btn_cancel);
 		let bar = gtk::Revealer::builder()
 			.transition_type(gtk::RevealerTransitionType::SlideUp)
@@ -238,6 +247,7 @@ impl BrowserPage {
 			list_pending: Cell::new(false),
 			bar,
 			bar_progress,
+			bar_percent,
 			total_files: Cell::new(0),
 			total_bytes: Cell::new(0),
 			transfer_store: gio::ListStore::new::<glib::BoxedAnyObject>(),
@@ -702,6 +712,7 @@ impl BrowserPage {
 		self.bytes_done.set(0);
 		self.global_speed_bps.set(0.0);
 		self.bar_progress.set_fraction(0.0);
+		self.bar_percent.set_text("0.00%");
 
 		self.transfer_store.remove_all();
 		let mut index = self.transfer_index.borrow_mut();
@@ -738,6 +749,9 @@ impl BrowserPage {
 			((done + failed) as f64 / total_f as f64).clamp(0.0, 1.0)
 		};
 		self.bar_progress.set_fraction(fraction);
+		self
+			.bar_percent
+			.set_text(&format!("{:.2}%", fraction * 100.0));
 		self.bytes_done.set(bytes);
 		self
 			.global_speed_bps
