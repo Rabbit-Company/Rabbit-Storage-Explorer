@@ -924,6 +924,7 @@ impl BrowserPage {
 		let selection = gtk::NoSelection::new(Some(self.transfer_store.clone()));
 		let view = gtk::ListView::new(Some(selection), Some(factory));
 		view.set_vexpand(true);
+		view.add_css_class("transfers-list");
 
 		let scroller = gtk::ScrolledWindow::builder()
 			.hscrollbar_policy(gtk::PolicyType::Never)

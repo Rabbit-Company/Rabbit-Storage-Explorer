@@ -34,3 +34,9 @@ box.drop-into {
 	background: alpha(@accent_bg_color, 0.25);
 	border-radius: 6px;
 }
+
+.transfers-list row:hover {
+	background: none;
+	background-color: transparent;
+	box-shadow: none;
+}
