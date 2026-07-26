@@ -1,6 +1,7 @@
 //! Bucket browser: virtualized object list (ColumnView), breadcrumb navigation,
 //! drag-and-drop uploads, selection actions and the transfer status bar.
 
+use super::transfer_item::{ItemState, TransferItem};
 use super::{human_eta, human_size, human_time};
 use crate::storage::RemoteEntry;
 use crate::worker::{Command, FileProgress, TransferKind};
@@ -10,26 +11,6 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
-
-#[derive(Clone, Copy, PartialEq)]
-enum ItemState {
-	Queued,
-	Active,
-	Done,
-	Failed,
-	Cancelled,
-}
-
-#[derive(Clone)]
-struct TransferItem {
-	id: u64,
-	name: String,
-	kind: TransferKind,
-	total: u64,
-	done: u64,
-	state: ItemState,
-	speed_bps: f64,
-}
 
 pub struct BrowserPage {
 	weak_self: std::rc::Weak<BrowserPage>,
@@ -60,8 +41,8 @@ pub struct BrowserPage {
 	total_bytes: Cell<u64>,
 	/// Rows of the transfers dialog; persists across dialog open/close.
 	transfer_store: gio::ListStore,
-	/// position in `transfer_store`.
-	transfer_index: RefCell<HashMap<u64, u32>>,
+	transfer_items: RefCell<HashMap<u64, TransferItem>>,
+	row_handlers: RefCell<HashMap<u64, glib::SignalHandlerId>>,
 	bytes_done: Cell<u64>,
 	/// Sum of the active files' speeds, bytes/second.
 	global_speed_bps: Cell<f64>,
@@ -254,8 +235,9 @@ impl BrowserPage {
 			bar_percent,
 			total_files: Cell::new(0),
 			total_bytes: Cell::new(0),
-			transfer_store: gio::ListStore::new::<glib::BoxedAnyObject>(),
-			transfer_index: RefCell::new(HashMap::new()),
+			transfer_store: gio::ListStore::new::<TransferItem>(),
+			transfer_items: RefCell::new(HashMap::new()),
+			row_handlers: RefCell::new(HashMap::new()),
 			bytes_done: Cell::new(0),
 			global_speed_bps: Cell::new(0.0),
 			stats_widgets: RefCell::new(None),
@@ -740,7 +722,6 @@ impl BrowserPage {
 		self.bar_progress.remove_css_class("stalled");
 
 		self.transfer_store.remove_all();
-		self.transfer_index.borrow_mut().clear();
 		self.append_transfer_rows(files);
 		self.update_stats_widgets();
 		self.bar.set_reveal_child(true);
@@ -756,21 +737,11 @@ impl BrowserPage {
 	}
 
 	fn append_transfer_rows(&self, files: Vec<FileProgress>) {
-		let mut index = self.transfer_index.borrow_mut();
+		let mut items = self.transfer_items.borrow_mut();
 		for f in files {
-			let pos = self.transfer_store.n_items();
-			index.insert(f.id, pos);
-			self
-				.transfer_store
-				.append(&glib::BoxedAnyObject::new(TransferItem {
-					id: f.id,
-					name: f.name,
-					kind: f.kind,
-					total: f.total,
-					done: 0,
-					state: ItemState::Queued,
-					speed_bps: 0.0,
-				}));
+			let item = TransferItem::new(f.id, f.kind, &f.name, f.total);
+			self.transfer_store.append(&item);
+			items.insert(f.id, item);
 		}
 	}
 
@@ -804,31 +775,16 @@ impl BrowserPage {
 			.set(files.iter().map(|f| f.speed_bps).sum());
 		self.update_stats_widgets();
 
+		let items = self.transfer_items.borrow();
 		for f in files {
-			self.update_transfer_item(f.id, |item| {
-				if item.state == ItemState::Cancelled {
-					return;
-				}
-				item.done = f.done;
-				item.speed_bps = f.speed_bps;
-				item.state = ItemState::Active;
-			});
+			if let Some(item) = items.get(&f.id) {
+				item.set_active(f.done, f.speed_bps);
+			}
 		}
 		if let Some((id, ok)) = finished {
-			self.update_transfer_item(id, |item| {
-				if item.state == ItemState::Cancelled {
-					return;
-				}
-				item.state = if ok {
-					ItemState::Done
-				} else {
-					ItemState::Failed
-				};
-				if ok {
-					item.done = item.total;
-				}
-				item.speed_bps = 0.0;
-			});
+			if let Some(item) = items.get(&id) {
+				item.set_finished(ok);
+			}
 		}
 	}
 
@@ -838,7 +794,8 @@ impl BrowserPage {
 		self.bar_progress.remove_css_class("stalled");
 		self.bar.set_reveal_child(false);
 		self.transfer_store.remove_all();
-		self.transfer_index.borrow_mut().clear();
+		self.transfer_items.borrow_mut().clear();
+		self.row_handlers.borrow_mut().clear();
 		self.global_speed_bps.set(0.0);
 		self.update_stats_widgets();
 		self.request_list();
@@ -914,35 +871,17 @@ impl BrowserPage {
 		self.update_stats_widgets();
 	}
 
-	fn update_transfer_item(&self, id: u64, apply: impl FnOnce(&mut TransferItem)) {
-		let Some(pos) = self.transfer_index.borrow().get(&id).copied() else {
-			return;
-		};
-		let Some(obj) = self
-			.transfer_store
-			.item(pos)
-			.and_downcast::<glib::BoxedAnyObject>()
-		else {
-			return;
-		};
-		let mut item = obj.borrow::<TransferItem>().clone();
-		apply(&mut item);
-		self
-			.transfer_store
-			.splice(pos, 1, &[glib::BoxedAnyObject::new(item)]);
-	}
-
 	fn show_transfers_dialog(&self) {
 		let Some(window) = self.window.upgrade() else {
 			return;
 		};
 
 		let cmd = self.cmd.clone();
-		let page = self.weak_self.clone();
 
 		let factory = gtk::SignalListItemFactory::new();
-		factory.connect_setup(move |_, item| {
-			let item = item.downcast_ref::<gtk::ListItem>().unwrap();
+		factory.connect_setup(move |_, list_item| {
+			let list_item = list_item.downcast_ref::<gtk::ListItem>().unwrap();
+
 			let status = gtk::Label::new(None);
 			status.set_xalign(0.0);
 			status.add_css_class("caption");
@@ -965,34 +904,9 @@ impl BrowserPage {
 			name_row.append(&name);
 			name_row.append(&cancel);
 
-			let cmd = cmd.clone();
-			let page = page.clone();
-			let li = item.clone();
-			cancel.connect_clicked(move |_| {
-				let Some(obj) = li.item().and_downcast::<glib::BoxedAnyObject>() else {
-					return;
-				};
-				let (id, cancellable) = {
-					let data = obj.borrow::<TransferItem>();
-					(
-						data.id,
-						matches!(data.state, ItemState::Queued | ItemState::Active),
-					)
-				}; // borrow dropped before update_transfer_item re-borrows
-				if !cancellable {
-					return;
-				}
-				let _ = cmd.send_blocking(Command::CancelFile { id });
-				if let Some(p) = page.upgrade() {
-					p.update_transfer_item(id, |it| {
-						it.state = ItemState::Cancelled;
-						it.speed_bps = 0.0;
-					});
-				}
-			});
-
 			let bar = gtk::ProgressBar::new();
 			bar.set_show_text(true);
+
 			let row = gtk::Box::new(gtk::Orientation::Vertical, 4);
 			row.set_margin_start(14);
 			row.set_margin_end(14);
@@ -1001,87 +915,71 @@ impl BrowserPage {
 			row.append(&status);
 			row.append(&name_row);
 			row.append(&bar);
-			item.set_child(Some(&row));
+			list_item.set_child(Some(&row));
+
+			let li = list_item.clone();
+			let cmd = cmd.clone();
+			cancel.connect_clicked(move |_| {
+				let Some(item) = li.item().and_downcast::<TransferItem>() else {
+					return;
+				};
+				if !matches!(item.state(), ItemState::Queued | ItemState::Active) {
+					return;
+				}
+				let _ = cmd.send_blocking(Command::CancelFile { id: item.id() });
+				item.set_cancelled(); // in-place; repaints this row immediately
+			});
 		});
-		factory.connect_bind(|_, item| {
-			let item = item.downcast_ref::<gtk::ListItem>().unwrap();
-			let Some(obj) = item.item().and_downcast::<glib::BoxedAnyObject>() else {
-				return;
-			};
-			let data = obj.borrow::<TransferItem>();
-			let row = item.child().and_downcast::<gtk::Box>().unwrap();
-			let status = row.first_child().and_downcast::<gtk::Label>().unwrap();
-			let name_row = status.next_sibling().and_downcast::<gtk::Box>().unwrap();
-			let kind_icon = name_row.first_child().and_downcast::<gtk::Image>().unwrap();
-			let name = kind_icon
-				.next_sibling()
-				.and_downcast::<gtk::Label>()
-				.unwrap();
-			let bar = row.last_child().and_downcast::<gtk::ProgressBar>().unwrap();
 
-			let cancel = name_row.last_child().and_downcast::<gtk::Button>().unwrap();
-			cancel.set_visible(matches!(data.state, ItemState::Queued | ItemState::Active));
+		factory.connect_bind({
+			let page = self.weak_self.clone();
+			move |_, list_item| {
+				let list_item = list_item.downcast_ref::<gtk::ListItem>().unwrap();
+				let Some(item) = list_item.item().and_downcast::<TransferItem>() else {
+					return;
+				};
 
-			name.set_text(&data.name);
-			name.set_tooltip_text(Some(&data.name));
+				let row = list_item.child().and_downcast::<gtk::Box>().unwrap();
+				let status = row.first_child().and_downcast::<gtk::Label>().unwrap();
+				let name_row = status.next_sibling().and_downcast::<gtk::Box>().unwrap();
+				let bar = row.last_child().and_downcast::<gtk::ProgressBar>().unwrap();
+				let kind_icon = name_row.first_child().and_downcast::<gtk::Image>().unwrap();
+				let name = kind_icon
+					.next_sibling()
+					.and_downcast::<gtk::Label>()
+					.unwrap();
+				let cancel = name_row.last_child().and_downcast::<gtk::Button>().unwrap();
 
-			let (icon_name, tip) = match data.kind {
-				TransferKind::Upload => ("document-send-symbolic", "Uploading"),
-				TransferKind::Download => ("folder-download-symbolic", "Downloading"),
-			};
-			kind_icon.set_icon_name(Some(icon_name));
-			kind_icon.set_tooltip_text(Some(tip));
+				let populate = std::rc::Rc::new(move |it: &TransferItem| {
+					populate_row(&status, &kind_icon, &name, &cancel, &bar, it);
+				});
+				populate(&item);
 
-			for class in ["dim-label", "success", "error"] {
-				status.remove_css_class(class);
-			}
-			match data.state {
-				ItemState::Queued => {
-					status.set_text("Waiting");
-					status.add_css_class("dim-label");
-					bar.set_fraction(0.0);
-					bar.set_text(Some(""));
-				}
-				ItemState::Active => {
-					if data.speed_bps > 0.0 {
-						let mut text = format!("{:.1} Mbps", data.speed_bps * 8.0 / 1_000_000.0);
-						if data.total > data.done {
-							let eta = (data.total - data.done) as f64 / data.speed_bps;
-							text.push_str(&format!(" · {} left", human_eta(eta)));
-						}
-						status.set_text(&text);
-					} else {
-						status.set_text("..."); // first second: no full window measured yet
+				let handler = item.connect_changed({
+					let populate = populate.clone();
+					move |it| populate(it)
+				});
+
+				if let Some(page) = page.upgrade() {
+					let mut map = page.row_handlers.borrow_mut();
+					if let Some(old) = map.remove(&item.id()) {
+						item.disconnect(old);
 					}
-					let fraction = if data.total > 0 {
-						(data.done as f64 / data.total as f64).clamp(0.0, 1.0)
-					} else {
-						0.0
-					};
-					bar.set_fraction(fraction);
-					bar.set_text(Some(&format!(
-						"{} / {}  ({:.0}%)",
-						human_size(data.done),
-						human_size(data.total),
-						fraction * 100.0
-					)));
+					map.insert(item.id(), handler);
 				}
-				ItemState::Done => {
-					status.set_text("Done");
-					status.add_css_class("success");
-					bar.set_fraction(1.0);
-					bar.set_text(Some(&human_size(data.total)));
-				}
-				ItemState::Failed => {
-					status.set_text("Failed");
-					status.add_css_class("error");
-					bar.set_text(Some(""));
-				}
-				ItemState::Cancelled => {
-					status.set_text("Cancelled");
-					status.add_css_class("dim-label");
-					bar.set_fraction(0.0);
-					bar.set_text(Some(""));
+			}
+		});
+
+		factory.connect_unbind({
+			let page = self.weak_self.clone();
+			move |_, list_item| {
+				let list_item = list_item.downcast_ref::<gtk::ListItem>().unwrap();
+				if let Some(item) = list_item.item().and_downcast::<TransferItem>() {
+					if let Some(page) = page.upgrade() {
+						if let Some(handler) = page.row_handlers.borrow_mut().remove(&item.id()) {
+							item.disconnect(handler);
+						}
+					}
 				}
 			}
 		});
@@ -1207,6 +1105,72 @@ fn menu_row(icon: &str, label: &str) -> gtk::Button {
 	b.set_child(Some(&content));
 	b.add_css_class("flat");
 	b
+}
+
+fn populate_row(
+	status: &gtk::Label,
+	kind_icon: &gtk::Image,
+	name: &gtk::Label,
+	cancel: &gtk::Button,
+	bar: &gtk::ProgressBar,
+	item: &TransferItem,
+) {
+	name.set_text(&item.name());
+	kind_icon.set_icon_name(Some(match item.kind() {
+		TransferKind::Upload => "document-send-symbolic",
+		TransferKind::Download => "folder-download-symbolic",
+	}));
+
+	for c in ["success", "error", "dim-label"] {
+		status.remove_css_class(c);
+	}
+
+	match item.state() {
+		ItemState::Queued => {
+			status.set_text("Waiting");
+			status.add_css_class("dim-label");
+			bar.set_fraction(0.0);
+			bar.set_text(Some(""));
+		}
+		ItemState::Active => {
+			let (done, total) = (item.done(), item.total());
+			let frac = if total > 0 {
+				done as f64 / total as f64
+			} else {
+				0.0
+			};
+			bar.set_fraction(frac);
+			bar.set_text(Some(&format!("{:.2}%", (frac * 100.0))));
+			status.set_text(&format!(
+				"{} / {} · {}/s",
+				human_size(done),
+				human_size(total),
+				human_size(item.speed_bps() as u64),
+			));
+		}
+		ItemState::Done => {
+			status.set_text("Done");
+			status.add_css_class("success");
+			bar.set_fraction(1.0);
+			bar.set_text(Some("100%"));
+		}
+		ItemState::Failed => {
+			status.set_text("Failed");
+			status.add_css_class("error");
+			bar.set_text(Some(""));
+		}
+		ItemState::Cancelled => {
+			status.set_text("Cancelled");
+			status.add_css_class("dim-label");
+			bar.set_fraction(0.0);
+			bar.set_text(Some(""));
+		}
+	}
+
+	cancel.set_visible(matches!(
+		item.state(),
+		ItemState::Queued | ItemState::Active
+	));
 }
 
 fn icon_button(icon: &str, tooltip: &str) -> gtk::Button {

@@ -86,6 +86,10 @@ pub struct RemoteEntry {
 	pub encrypted: Option<bool>,
 }
 
+/// Called by a backend with the number of bytes it just handed to the transport,
+/// as it happens. Lets the transfer engine show wire-accurate progress and speed.
+pub type ProgressSink = std::sync::Arc<dyn Fn(u64) + Send + Sync>;
+
 pub struct MultipartUpload {
 	pub upload_id: String,
 	pub key: String,
@@ -132,13 +136,15 @@ pub trait StorageBackend: Send + Sync {
 	}
 
 	async fn create_multipart(&self, key: &str) -> Result<MultipartUpload>;
-	/// Returns the part's ETag.
+
 	async fn upload_part(
 		&self,
 		mp: &MultipartUpload,
 		part_number: i32,
 		data: Vec<u8>,
+		on_bytes: Option<ProgressSink>,
 	) -> Result<String>;
+
 	async fn complete_multipart(&self, mp: &MultipartUpload, etags: Vec<(i32, String)>)
 		-> Result<()>;
 	async fn abort_multipart(&self, mp: &MultipartUpload) -> Result<()>;

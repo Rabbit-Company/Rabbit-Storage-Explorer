@@ -6,6 +6,7 @@
 
 use super::{ChannelReader, MultipartUpload, RawObject, Reader, StorageBackend};
 use crate::settings::ConnectionProfile;
+use crate::storage::ProgressSink;
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
 use smb2::pack::FileTime;
@@ -298,6 +299,7 @@ impl StorageBackend for SmbBackend {
 		mp: &MultipartUpload,
 		_part_number: i32,
 		data: Vec<u8>,
+		on_bytes: Option<ProgressSink>,
 	) -> Result<String> {
 		let mut writer = self
 			.uploads
@@ -310,6 +312,9 @@ impl StorageBackend for SmbBackend {
 			if let Err(e) = writer.write_chunk(chunk).await {
 				result = Err(anyhow!("SMB write failed: {e}"));
 				break;
+			}
+			if let Some(cb) = &on_bytes {
+				cb(chunk.len() as u64);
 			}
 		}
 		match result {

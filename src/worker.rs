@@ -6,6 +6,7 @@
 
 use crate::crypto::{self, VaultKeys};
 use crate::settings::{BackendKind, ConnectionProfile, Settings};
+use crate::storage::ProgressSink;
 use crate::storage::{
 	nfs::NfsBackend, s3::S3Backend, sftp::SftpBackend, smb::SmbBackend, RawObject, RemoteEntry,
 	StorageBackend,
@@ -804,6 +805,14 @@ fn path_to_key(rel: &std::path::Path) -> String {
 		.join("/")
 }
 
+/// On-wire (ciphertext) length of a `plain`-byte file: a header plus one AEAD
+/// tag per CHUNK-sized piece. Matches the inverse math in `download_one`.
+fn wire_len(plain: u64) -> u64 {
+	let chunk = crypto::CHUNK as u64;
+	let n_chunks = ((plain + chunk - 1) / chunk).max(1);
+	crypto::HEADER_LEN as u64 + plain + n_chunks * crypto::TAG as u64
+}
+
 async fn run_upload(
 	hub: Arc<TransferHub>,
 	s: Session,
@@ -819,11 +828,25 @@ async fn run_upload(
 		let _ = ev.send(Event::Toast("Nothing to upload".into())).await;
 		return;
 	}
+
 	let items: Vec<(u64, PathBuf, String, u64)> = files
 		.into_iter()
 		.map(|(path, rel, size)| (hub.next_id(), path, rel, size))
 		.collect();
-	let total_bytes: u64 = items.iter().map(|(_, _, _, size)| *size).sum();
+
+	// Encrypted files that will use the multipart path are credited in wire
+	// (ciphertext) bytes, so their displayed total must be wire-sized too.
+	let threshold = st.multipart_threshold_mib * 1024 * 1024;
+	let encrypted = s.keys.is_some();
+	let meter = |plain: u64| -> u64 {
+		if encrypted && plain > threshold {
+			wire_len(plain)
+		} else {
+			plain
+		}
+	};
+
+	let total_bytes: u64 = items.iter().map(|(_, _, _, size)| meter(*size)).sum();
 	let roster: Vec<FileProgress> = items
 		.iter()
 		.map(|(id, _, rel, size)| FileProgress {
@@ -831,7 +854,7 @@ async fn run_upload(
 			name: rel.clone(),
 			kind: TransferKind::Upload,
 			done: 0,
-			total: *size,
+			total: meter(*size),
 			speed_bps: 0.0,
 		})
 		.collect();
@@ -905,7 +928,7 @@ async fn upload_one(
 	dest_prefix: &str,
 	id: u64,
 	rel: &str,
-	progress: &Progress,
+	progress: &Arc<Progress>,
 	cancel: &CancellationToken,
 ) -> Result<()> {
 	let key = match s.keys.as_deref() {
@@ -951,7 +974,7 @@ async fn upload_small(
 	key: &str,
 	id: u64,
 	plain_len: u64,
-	progress: &Progress,
+	progress: &Arc<Progress>,
 ) -> Result<()> {
 	let data = tokio::fs::read(path).await.context("reading local file")?;
 	let body = match s.keys.as_deref() {
@@ -970,11 +993,16 @@ async fn upload_multipart(
 	path: &PathBuf,
 	key: &str,
 	id: u64,
-	progress: &Progress,
+	progress: &Arc<Progress>,
 	cancel: &CancellationToken,
 ) -> Result<()> {
 	let part_size = (st.part_size_mib.max(5) * 1024 * 1024) as usize;
 	let mp = backend.create_multipart(key).await?;
+
+	let sink: ProgressSink = {
+		let progress = progress.clone();
+		std::sync::Arc::new(move |n| progress.tick(id, n))
+	};
 
 	let result: Result<()> = async {
 		let mut file = tokio::fs::File::open(path)
@@ -997,7 +1025,7 @@ async fn upload_multipart(
 			if cancel.is_cancelled() {
 				return Err(anyhow!("cancelled"));
 			}
-			// Fill one plaintext chunk (read_exact semantics, tolerant of EOF).
+
 			let mut filled = 0usize;
 			while filled < chunk.len() {
 				let n = file.read(&mut chunk[filled..]).await?;
@@ -1013,11 +1041,12 @@ async fn upload_multipart(
 				Some(enc) => part_buf.extend(enc.seal_chunk(&chunk[..filled], last)?),
 				None => part_buf.extend_from_slice(&chunk[..filled]),
 			}
-			progress.tick(id, filled as u64);
 
 			if part_buf.len() >= part_size || last {
 				let data = std::mem::take(&mut part_buf);
-				let etag = backend.upload_part(&mp, part_number, data).await?;
+				let etag = backend
+					.upload_part(&mp, part_number, data, Some(sink.clone()))
+					.await?;
 				etags.push((part_number, etag));
 				part_number += 1;
 			}

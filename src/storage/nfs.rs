@@ -4,6 +4,7 @@
 
 use super::{ChannelReader, MultipartUpload, RawObject, Reader, StorageBackend};
 use crate::settings::ConnectionProfile;
+use crate::storage::ProgressSink;
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
 use nfs3_client::nfs3_types::nfs3::{
@@ -201,7 +202,13 @@ impl NfsBackend {
 
 	/// Write a buffer at an offset, honouring short writes. UNSTABLE writes;
 	/// callers COMMIT when the file is complete.
-	async fn write_at(&self, fh: &nfs_fh3, mut offset: u64, data: &[u8]) -> Result<u64> {
+	async fn write_at(
+		&self,
+		fh: &nfs_fh3,
+		mut offset: u64,
+		data: &[u8],
+		on_bytes: Option<&ProgressSink>,
+	) -> Result<u64> {
 		for chunk in data.chunks(WRITE_CHUNK) {
 			let mut written = 0usize;
 			while written < chunk.len() {
@@ -225,6 +232,9 @@ impl NfsBackend {
 						}
 						written += ok.count as usize;
 						offset += u64::from(ok.count);
+						if let Some(cb) = on_bytes {
+							cb(u64::from(ok.count));
+						}
 					}
 					Nfs3Result::Err((stat, _)) => bail!("NFS write error: {stat:?}"),
 				}
@@ -460,7 +470,7 @@ impl StorageBackend for NfsBackend {
 
 	async fn put(&self, key: &str, data: Vec<u8>) -> Result<()> {
 		let fh = self.create_truncated(key).await?;
-		self.write_at(&fh, 0, &data).await?;
+		self.write_at(&fh, 0, &data, None).await?;
 		self.commit(&fh).await
 	}
 
@@ -534,6 +544,7 @@ impl StorageBackend for NfsBackend {
 		mp: &MultipartUpload,
 		_part_number: i32,
 		data: Vec<u8>,
+		on_bytes: Option<ProgressSink>,
 	) -> Result<String> {
 		let (fh, offset, key) = self
 			.uploads
@@ -541,7 +552,7 @@ impl StorageBackend for NfsBackend {
 			.await
 			.remove(&mp.upload_id)
 			.ok_or_else(|| anyhow!("unknown upload id"))?;
-		let result = self.write_at(&fh, offset, &data).await;
+		let result = self.write_at(&fh, offset, &data, on_bytes.as_ref()).await;
 		match result {
 			Ok(new_offset) => {
 				self

@@ -13,6 +13,7 @@
 use super::{MultipartUpload, RawObject, Reader, StorageBackend};
 use crate::crypto;
 use crate::settings::{self, ConnectionProfile};
+use crate::storage::ProgressSink;
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
 use russh::keys::{load_secret_key, PrivateKeyWithHashAlg};
@@ -33,6 +34,8 @@ use tokio::sync::Mutex;
 /// be creatable by connecting users or pre-created by an administrator:
 /// `mkdir -m 1777 /var/lib/rabbit-storage-explorer`.
 const GLOBAL_VAULT_DIR: &str = "/var/lib/rabbit-storage-explorer";
+
+const SFTP_WRITE_CHUNK: usize = 256 * 1024;
 
 struct HostKeyRecorder {
 	observed: Arc<StdMutex<Option<String>>>,
@@ -439,10 +442,8 @@ impl StorageBackend for SftpBackend {
 		mp: &MultipartUpload,
 		_part_number: i32,
 		data: Vec<u8>,
+		on_bytes: Option<ProgressSink>,
 	) -> Result<String> {
-		// Parts for one file always arrive in order from a single task, so a
-		// sequential append is correct. Take the handle out of the map while
-		// writing so other files' parts aren't blocked.
 		let mut file = self
 			.uploads
 			.lock()
@@ -450,12 +451,18 @@ impl StorageBackend for SftpBackend {
 			.remove(&mp.upload_id)
 			.ok_or_else(|| anyhow!("unknown upload id"))?;
 		let result = with_timeout(600, async {
-			file.write_all(&data).await.map_err(Into::into)
+			for chunk in data.chunks(SFTP_WRITE_CHUNK) {
+				file.write_all(chunk).await?;
+				if let Some(cb) = &on_bytes {
+					cb(chunk.len() as u64);
+				}
+			}
+			Ok::<(), anyhow::Error>(())
 		})
 		.await;
 		self.uploads.lock().await.insert(mp.upload_id.clone(), file);
 		result.context("writing remote file")?;
-		Ok(String::new()) // SFTP has no ETags
+		Ok(String::new())
 	}
 
 	async fn complete_multipart(

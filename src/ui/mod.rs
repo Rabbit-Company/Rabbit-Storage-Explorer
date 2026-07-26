@@ -1,6 +1,7 @@
 pub mod browser_page;
 pub mod connection_page;
 pub mod settings_dialog;
+pub mod transfer_item;
 pub mod window;
 
 use gtk::glib;

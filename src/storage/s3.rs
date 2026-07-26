@@ -1,5 +1,7 @@
 //! S3-compatible backend: AWS S3, MinIO, and other S3-compatible object stores.
 
+use crate::storage::ProgressSink;
+
 use super::{MultipartUpload, RawObject, Reader, StorageBackend};
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
@@ -239,7 +241,9 @@ impl StorageBackend for S3Backend {
 		mp: &MultipartUpload,
 		part_number: i32,
 		data: Vec<u8>,
+		on_bytes: Option<ProgressSink>,
 	) -> Result<String> {
+		let len = data.len() as u64;
 		let out = self
 			.client
 			.upload_part()
@@ -251,6 +255,10 @@ impl StorageBackend for S3Backend {
 			.send()
 			.await
 			.with_context(|| format!("uploading part {part_number}"))?;
+
+		if let Some(cb) = on_bytes {
+			cb(len);
+		}
 		Ok(out.e_tag().unwrap_or_default().to_string())
 	}
 
