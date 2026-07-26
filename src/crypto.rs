@@ -2,11 +2,12 @@
 //!
 //! Design:
 //! * Password -> Argon2id (random 16-byte salt, stored in the bucket) -> 32-byte master key.
-//! * HKDF-SHA256 splits the master key into a content key (ChaCha20-Poly1305)
+//! * HKDF-SHA256 splits the master key into a content key (XChaCha20-Poly1305)
 //!   and a filename key (AES-256-SIV, deterministic so lookups/listings work).
-//! * File format: `"RSE1" || file_nonce(8)` header, then 1 MiB plaintext chunks,
-//!   each sealed with nonce = file_nonce || u32_be(counter). The final chunk sets
-//!   the counter's high bit, which makes truncation attacks detectable.
+//! * File format: `"RSE1" || file_prefix(20)` header (24 bytes total), then 1 MiB
+//!   plaintext chunks, each sealed with XChaCha20-Poly1305 using
+//!   nonce = file_prefix || u32_be(counter). The final chunk sets the counter's
+//!   high bit, which makes truncation attacks detectable.
 //! * Filenames: each path segment is AES-SIV encrypted and base32hex encoded.
 //!   Deterministic by design - equal names encrypt to equal ciphertexts so that
 //!   prefix listing and navigation still work. (Trade-off: an observer can see
@@ -17,7 +18,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use argon2::Argon2;
 use chacha20poly1305::{
 	aead::{Aead, KeyInit as ChaChaKeyInit},
-	ChaCha20Poly1305, Nonce,
+	XChaCha20Poly1305, XNonce,
 };
 use data_encoding::BASE32HEX_NOPAD;
 use hkdf::Hkdf;
@@ -27,7 +28,8 @@ use sha2::Sha256;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 pub const MAGIC: &[u8; 4] = b"RSE1";
-pub const HEADER_LEN: usize = 12; // magic(4) + file_nonce(8)
+pub const PREFIX_LEN: usize = 20; // per-file random nonce prefix
+pub const HEADER_LEN: usize = MAGIC.len() + PREFIX_LEN; // magic(4) + prefix(20) = 24
 pub const CHUNK: usize = 1 << 20; // 1 MiB plaintext per chunk
 pub const TAG: usize = 16; // Poly1305 tag
 pub const CIPHER_CHUNK: usize = CHUNK + TAG;
@@ -62,15 +64,15 @@ pub fn derive_keys(password: &str, salt: &[u8]) -> Result<VaultKeys> {
 }
 
 pub struct Encryptor {
-	cipher: ChaCha20Poly1305,
-	prefix: [u8; 8],
+	cipher: XChaCha20Poly1305,
+	prefix: [u8; PREFIX_LEN],
 	counter: u32,
 }
 
 impl Encryptor {
 	pub fn new(keys: &VaultKeys) -> Self {
-		let cipher = ChaCha20Poly1305::new_from_slice(&keys.content).expect("32-byte key");
-		let mut prefix = [0u8; 8];
+		let cipher = XChaCha20Poly1305::new_from_slice(&keys.content).expect("32-byte key");
+		let mut prefix = [0u8; PREFIX_LEN];
 		rand::rng().fill_bytes(&mut prefix);
 		Self {
 			cipher,
@@ -79,17 +81,17 @@ impl Encryptor {
 		}
 	}
 
-	/// The 12-byte header that must precede all ciphertext chunks.
+	/// The 24-byte header that must precede all ciphertext chunks.
 	pub fn header(&self) -> [u8; HEADER_LEN] {
 		let mut h = [0u8; HEADER_LEN];
-		h[..4].copy_from_slice(MAGIC);
-		h[4..].copy_from_slice(&self.prefix);
+		h[..MAGIC.len()].copy_from_slice(MAGIC);
+		h[MAGIC.len()..].copy_from_slice(&self.prefix);
 		h
 	}
 
 	/// Seal one chunk (must be called in order; `last` on the final chunk).
 	pub fn seal_chunk(&mut self, plaintext: &[u8], last: bool) -> Result<Vec<u8>> {
-		let nonce = Nonce::from(chunk_nonce(&self.prefix, self.counter, last));
+		let nonce = XNonce::from(chunk_nonce(&self.prefix, self.counter, last));
 		self.counter = self
 			.counter
 			.checked_add(1)
@@ -102,19 +104,19 @@ impl Encryptor {
 }
 
 pub struct Decryptor {
-	cipher: ChaCha20Poly1305,
-	prefix: [u8; 8],
+	cipher: XChaCha20Poly1305,
+	prefix: [u8; PREFIX_LEN],
 	counter: u32,
 }
 
 impl Decryptor {
 	pub fn new(keys: &VaultKeys, header: &[u8]) -> Result<Self> {
-		if header.len() < HEADER_LEN || &header[..4] != MAGIC {
+		if header.len() < HEADER_LEN || &header[..MAGIC.len()] != MAGIC {
 			bail!("not a Rabbit Storage Explorer encrypted file (bad header)");
 		}
-		let cipher = ChaCha20Poly1305::new_from_slice(&keys.content).expect("32-byte key");
-		let mut prefix = [0u8; 8];
-		prefix.copy_from_slice(&header[4..HEADER_LEN]);
+		let cipher = XChaCha20Poly1305::new_from_slice(&keys.content).expect("32-byte key");
+		let mut prefix = [0u8; PREFIX_LEN];
+		prefix.copy_from_slice(&header[MAGIC.len()..HEADER_LEN]);
 		Ok(Self {
 			cipher,
 			prefix,
@@ -123,7 +125,7 @@ impl Decryptor {
 	}
 
 	pub fn open_chunk(&mut self, ciphertext: &[u8], last: bool) -> Result<Vec<u8>> {
-		let nonce = Nonce::from(chunk_nonce(&self.prefix, self.counter, last));
+		let nonce = XNonce::from(chunk_nonce(&self.prefix, self.counter, last));
 		self.counter = self
 			.counter
 			.checked_add(1)
@@ -140,11 +142,11 @@ impl Decryptor {
 	}
 }
 
-fn chunk_nonce(prefix: &[u8; 8], counter: u32, last: bool) -> [u8; 12] {
-	let mut nonce = [0u8; 12];
-	nonce[..8].copy_from_slice(prefix);
+fn chunk_nonce(prefix: &[u8; PREFIX_LEN], counter: u32, last: bool) -> [u8; 24] {
+	let mut nonce = [0u8; 24];
+	nonce[..PREFIX_LEN].copy_from_slice(prefix);
 	let c = if last { counter | LAST_FLAG } else { counter };
-	nonce[8..].copy_from_slice(&c.to_be_bytes());
+	nonce[PREFIX_LEN..].copy_from_slice(&c.to_be_bytes());
 	nonce
 }
 
@@ -329,5 +331,88 @@ mod tests {
 		let (vf, _) = create_vault("pw").unwrap();
 		assert!(open_vault(&vf, "pw").is_ok());
 		assert!(open_vault(&vf, "wrong").is_err());
+	}
+
+	#[test]
+	fn header_size_matches_format() {
+		// magic(4) + prefix(20) = 24. If this changes, the wire format changed;
+		// worker resume math and encrypted_size all key off HEADER_LEN.
+		assert_eq!(HEADER_LEN, 24);
+		assert_eq!(HEADER_LEN, MAGIC.len() + PREFIX_LEN);
+
+		let enc = Encryptor::new(&keys());
+		let h = enc.header();
+		assert_eq!(h.len(), HEADER_LEN);
+		assert_eq!(&h[..MAGIC.len()], MAGIC);
+	}
+
+	#[test]
+	fn header_roundtrips_into_decryptor() {
+		let k = keys();
+		let enc = Encryptor::new(&k);
+		let header = enc.header();
+		// A decryptor built from just the 24-byte header must accept it and
+		// recover the same nonce prefix the encryptor is using.
+		assert!(Decryptor::new(&k, &header).is_ok());
+		// A truncated or magic-less header must be rejected.
+		assert!(Decryptor::new(&k, &header[..HEADER_LEN - 1]).is_err());
+		let mut bad = header;
+		bad[0] ^= 0xFF;
+		assert!(Decryptor::new(&k, &bad).is_err());
+	}
+
+	#[test]
+	fn prefix_is_random_per_file() {
+		// Two encryptors under the same key must not share a nonce prefix;
+		// this is the whole point of widening to 160 random bits.
+		let k = keys();
+		let a = Encryptor::new(&k).header();
+		let b = Encryptor::new(&k).header();
+		assert_ne!(a, b);
+	}
+
+	#[test]
+	fn resume_from_chunk_boundary() {
+		// Simulate an interrupted download: decrypt the first whole chunk, then
+		// rebuild the decryptor from the header alone, seek past what we have,
+		// and finish. The concatenation must equal the original plaintext.
+		let k = keys();
+		let plain = vec![0x5Au8; 3 * CHUNK + 123];
+		let ct = encrypt_bytes(&k, &plain).unwrap();
+		let (n_chunks, last_len) = chunk_layout(ct.len() as u64).unwrap();
+		assert!(n_chunks >= 2);
+
+		// First pass: open only the first chunk (what "already on disk" covers).
+		let mut first = Decryptor::new(&k, &ct).unwrap();
+		let done_chunks = 1u32;
+		let mut recovered = first
+			.open_chunk(&ct[HEADER_LEN..HEADER_LEN + CIPHER_CHUNK], false)
+			.unwrap();
+
+		// Second pass: fresh decryptor from the header, seek to the boundary.
+		let mut resumed = Decryptor::new(&k, &ct).unwrap();
+		resumed.seek_to(done_chunks);
+		let mut off = HEADER_LEN + done_chunks as usize * CIPHER_CHUNK;
+		for i in done_chunks as u64..n_chunks {
+			let last = i == n_chunks - 1;
+			let len = if last { last_len } else { CIPHER_CHUNK };
+			recovered.extend(resumed.open_chunk(&ct[off..off + len], last).unwrap());
+			off += len;
+		}
+
+		assert_eq!(recovered, plain);
+	}
+
+	#[test]
+	fn resume_wrong_boundary_fails() {
+		// Seeking to the wrong chunk index yields the wrong nonce, so the AEAD
+		// tag check must fail rather than returning garbage plaintext.
+		let k = keys();
+		let ct = encrypt_bytes(&k, &vec![1u8; 2 * CHUNK]).unwrap();
+		let mut dec = Decryptor::new(&k, &ct).unwrap();
+		dec.seek_to(1); // should be 0 for the first chunk
+		assert!(dec
+			.open_chunk(&ct[HEADER_LEN..HEADER_LEN + CIPHER_CHUNK], false)
+			.is_err());
 	}
 }

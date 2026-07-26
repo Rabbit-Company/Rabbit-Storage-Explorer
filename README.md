@@ -105,13 +105,16 @@ machine - the app falls back to the edit form so you can re-enter the secret.
 
 - **KDF:** Argon2id (OWASP defaults) over your password + a random 16-byte salt
   -> 32-byte master key -> HKDF-SHA256 -> separate content and filename keys.
-- **Content:** ChaCha20-Poly1305, 1 MiB chunks. Header `RSE1 || file_nonce(8)`;
-  chunk nonce = `file_nonce || counter`, with the final chunk's counter high bit
-  set so truncation is detected. Works streaming - large files are encrypted and
-  uploaded without ever being fully in RAM.
+- **Content:** XChaCha20-Poly1305, 1 MiB chunks. Header `RSE1 || file_prefix(20)`
+  (24 bytes); chunk nonce = `file_prefix || counter`, with the final chunk's
+  counter high bit set so truncation is detected. The 160-bit random per-file
+  prefix makes nonce reuse across files astronomically unlikely even at very
+  large file counts. Works streaming - large files are encrypted and uploaded
+  without ever being fully in RAM.
 - **Filenames:** each path segment encrypted with AES-256-SIV (deterministic, so
   listing/navigation still works) and base32-encoded. Trade-off: identical names
-  produce identical ciphertexts (an observer can correlate, but not read, names).
+  produce identical ciphertexts (an observer can correlate, but not read, names),
+  and ciphertext length tracks name length, so relative name sizes are visible.
 - The first E2EE connection initializes a small `.rse-vault` file (random salt + an encrypted canary
   used to verify your password on later connects). Its
   location is the storage unit's root: the bucket root for S3, the export root
