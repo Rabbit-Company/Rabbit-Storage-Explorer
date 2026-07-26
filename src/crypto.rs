@@ -124,7 +124,10 @@ impl Decryptor {
 
 	pub fn open_chunk(&mut self, ciphertext: &[u8], last: bool) -> Result<Vec<u8>> {
 		let nonce = Nonce::from(chunk_nonce(&self.prefix, self.counter, last));
-		self.counter += 1;
+		self.counter = self
+			.counter
+			.checked_add(1)
+			.ok_or_else(|| anyhow!("file too large (chunk counter overflow)"))?;
 
 		self
 			.cipher

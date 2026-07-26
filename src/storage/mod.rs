@@ -201,4 +201,20 @@ pub trait StorageBackend: Send + Sync {
 		}
 		Ok((len, reader))
 	}
+
+	/// Read the first `len` bytes of an object without streaming the whole
+	/// thing. Used to recover the 12-byte encryption header when resuming a
+	/// download from a chunk boundary.
+	///
+	/// Default: a bounded read via `get_range(key, 0)`, taking exactly `len`
+	/// bytes and dropping the rest. Correct everywhere, but backends whose
+	/// `get_range` streams from the start should override with a targeted read
+	/// so a resume doesn't kick off a full-object read for 12 bytes.
+	async fn read_header(&self, key: &str, len: usize) -> Result<Vec<u8>> {
+		use tokio::io::AsyncReadExt;
+		let (_total, mut reader) = self.get_range(key, 0).await?;
+		let mut buf = vec![0u8; len];
+		reader.read_exact(&mut buf).await?;
+		Ok(buf)
+	}
 }

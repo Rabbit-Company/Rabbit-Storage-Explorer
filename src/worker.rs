@@ -996,6 +996,8 @@ async fn upload_multipart(
 	progress: &Arc<Progress>,
 	cancel: &CancellationToken,
 ) -> Result<()> {
+	const S3_MIN_PART: usize = 5 * 1024 * 1024;
+
 	let part_size = (st.part_size_mib.max(5) * 1024 * 1024) as usize;
 	let mp = backend.create_multipart(key).await?;
 
@@ -1044,6 +1046,13 @@ async fn upload_multipart(
 
 			if part_buf.len() >= part_size || last {
 				let data = std::mem::take(&mut part_buf);
+				if !last && data.len() < S3_MIN_PART {
+					return Err(anyhow!(
+						"internal: multipart part {part_number} is {} bytes, \
+						 below the 5 MiB minimum",
+						data.len()
+					));
+				}
 				let etag = backend
 					.upload_part(&mp, part_number, data, Some(sink.clone()))
 					.await?;
@@ -1330,10 +1339,16 @@ async fn download_one(
 						.await
 						.context("reading header")?;
 				} else {
-					let (_h, mut h_reader) = s.backend().await.get_range(key, 0).await?;
-					read_or_stall(h_reader.read_exact(&mut header))
+					let header_bytes = s
+						.backend()
+						.await
+						.read_header(key, crypto::HEADER_LEN)
 						.await
 						.context("reading header")?;
+					if header_bytes.len() < crypto::HEADER_LEN {
+						return Err(anyhow!("encrypted file too short to contain a header"));
+					}
+					header.copy_from_slice(&header_bytes[..crypto::HEADER_LEN]);
 				}
 				let mut dec = crypto::Decryptor::new(keys, &header)?;
 				dec.seek_to(completed as u32);

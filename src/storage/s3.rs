@@ -370,4 +370,19 @@ impl StorageBackend for S3Backend {
 		let body = out.body.into_async_read();
 		Ok((total, Box::pin(body)))
 	}
+
+	async fn read_header(&self, key: &str, len: usize) -> Result<Vec<u8>> {
+		let end = (len as u64).saturating_sub(1);
+		let out = self
+			.client
+			.get_object()
+			.bucket(&self.bucket)
+			.key(key)
+			.range(format!("bytes=0-{end}"))
+			.send()
+			.await
+			.with_context(|| format!("reading header: {key}"))?;
+		let data = out.body.collect().await.context("reading header body")?;
+		Ok(data.into_bytes().to_vec())
+	}
 }

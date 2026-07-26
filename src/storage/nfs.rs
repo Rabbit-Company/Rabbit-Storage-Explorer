@@ -660,4 +660,42 @@ impl StorageBackend for NfsBackend {
 		});
 		Ok((size, Box::pin(ChannelReader::new(rx))))
 	}
+
+	async fn read_header(&self, key: &str, len: usize) -> Result<Vec<u8>> {
+		let Some((fh, _size)) = self.file_handle(key).await? else {
+			bail!("reading header: {key} not found");
+		};
+		let mut out: Vec<u8> = Vec::with_capacity(len);
+		let mut offset = 0u64;
+		while out.len() < len {
+			let want = (len - out.len()) as u32;
+			let res = {
+				let mut conn = self.conn.lock().await;
+				conn
+					.nfs3_client
+					.read(&READ3args {
+						file: fh.clone(),
+						offset,
+						count: want,
+					})
+					.await
+			};
+			match res {
+				Ok(Nfs3Result::Ok(ok)) => {
+					if ok.data.is_empty() {
+						break;
+					}
+					offset += ok.data.len() as u64;
+					out.extend_from_slice(&ok.data);
+					if ok.eof {
+						break;
+					}
+				}
+				Ok(Nfs3Result::Err((stat, _))) => bail!("NFS read error: {stat:?}"),
+				Err(e) => bail!("NFS read failed: {e}"),
+			}
+		}
+		out.truncate(len);
+		Ok(out)
+	}
 }
