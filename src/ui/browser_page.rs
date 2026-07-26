@@ -17,10 +17,12 @@ enum ItemState {
 	Active,
 	Done,
 	Failed,
+	Cancelled,
 }
 
 #[derive(Clone)]
 struct TransferItem {
+	id: u64,
 	name: String,
 	kind: TransferKind,
 	total: u64,
@@ -58,8 +60,8 @@ pub struct BrowserPage {
 	total_bytes: Cell<u64>,
 	/// Rows of the transfers dialog; persists across dialog open/close.
 	transfer_store: gio::ListStore,
-	/// name -> position in `transfer_store`.
-	transfer_index: RefCell<HashMap<(TransferKind, String), u32>>,
+	/// position in `transfer_store`.
+	transfer_index: RefCell<HashMap<u64, u32>>,
 	bytes_done: Cell<u64>,
 	/// Sum of the active files' speeds, bytes/second.
 	global_speed_bps: Cell<f64>,
@@ -757,10 +759,11 @@ impl BrowserPage {
 		let mut index = self.transfer_index.borrow_mut();
 		for f in files {
 			let pos = self.transfer_store.n_items();
-			index.insert((f.kind, f.name.clone()), pos);
+			index.insert(f.id, pos);
 			self
 				.transfer_store
 				.append(&glib::BoxedAnyObject::new(TransferItem {
+					id: f.id,
 					name: f.name,
 					kind: f.kind,
 					total: f.total,
@@ -777,7 +780,7 @@ impl BrowserPage {
 		failed: u64,
 		bytes: u64,
 		files: Vec<FileProgress>,
-		finished: Option<(TransferKind, String, bool)>,
+		finished: Option<(u64, bool)>,
 	) {
 		self.last_progress.set(std::time::Instant::now());
 		if self.stalled.get() {
@@ -802,14 +805,20 @@ impl BrowserPage {
 		self.update_stats_widgets();
 
 		for f in files {
-			self.update_transfer_item(f.kind, &f.name, |item| {
+			self.update_transfer_item(f.id, |item| {
+				if item.state == ItemState::Cancelled {
+					return;
+				}
 				item.done = f.done;
 				item.speed_bps = f.speed_bps;
 				item.state = ItemState::Active;
 			});
 		}
-		if let Some((kind, name, ok)) = finished {
-			self.update_transfer_item(kind, &name, |item| {
+		if let Some((id, ok)) = finished {
+			self.update_transfer_item(id, |item| {
+				if item.state == ItemState::Cancelled {
+					return;
+				}
 				item.state = if ok {
 					ItemState::Done
 				} else {
@@ -905,18 +914,8 @@ impl BrowserPage {
 		self.update_stats_widgets();
 	}
 
-	fn update_transfer_item(
-		&self,
-		kind: TransferKind,
-		name: &str,
-		apply: impl FnOnce(&mut TransferItem),
-	) {
-		let Some(pos) = self
-			.transfer_index
-			.borrow()
-			.get(&(kind, name.to_string()))
-			.copied()
-		else {
+	fn update_transfer_item(&self, id: u64, apply: impl FnOnce(&mut TransferItem)) {
+		let Some(pos) = self.transfer_index.borrow().get(&id).copied() else {
 			return;
 		};
 		let Some(obj) = self
@@ -938,8 +937,11 @@ impl BrowserPage {
 			return;
 		};
 
+		let cmd = self.cmd.clone();
+		let page = self.weak_self.clone();
+
 		let factory = gtk::SignalListItemFactory::new();
-		factory.connect_setup(|_, item| {
+		factory.connect_setup(move |_, item| {
 			let item = item.downcast_ref::<gtk::ListItem>().unwrap();
 			let status = gtk::Label::new(None);
 			status.set_xalign(0.0);
@@ -951,9 +953,43 @@ impl BrowserPage {
 			name.set_xalign(0.0);
 			name.set_hexpand(true);
 			name.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+
+			let cancel = gtk::Button::from_icon_name("window-close-symbolic");
+			cancel.set_tooltip_text(Some("Cancel"));
+			cancel.set_valign(gtk::Align::Center);
+			cancel.add_css_class("flat");
+			cancel.add_css_class("circular");
+
 			let name_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
 			name_row.append(&kind_icon);
 			name_row.append(&name);
+			name_row.append(&cancel);
+
+			let cmd = cmd.clone();
+			let page = page.clone();
+			let li = item.clone();
+			cancel.connect_clicked(move |_| {
+				let Some(obj) = li.item().and_downcast::<glib::BoxedAnyObject>() else {
+					return;
+				};
+				let (id, cancellable) = {
+					let data = obj.borrow::<TransferItem>();
+					(
+						data.id,
+						matches!(data.state, ItemState::Queued | ItemState::Active),
+					)
+				}; // borrow dropped before update_transfer_item re-borrows
+				if !cancellable {
+					return;
+				}
+				let _ = cmd.send_blocking(Command::CancelFile { id });
+				if let Some(p) = page.upgrade() {
+					p.update_transfer_item(id, |it| {
+						it.state = ItemState::Cancelled;
+						it.speed_bps = 0.0;
+					});
+				}
+			});
 
 			let bar = gtk::ProgressBar::new();
 			bar.set_show_text(true);
@@ -982,6 +1018,9 @@ impl BrowserPage {
 				.and_downcast::<gtk::Label>()
 				.unwrap();
 			let bar = row.last_child().and_downcast::<gtk::ProgressBar>().unwrap();
+
+			let cancel = name_row.last_child().and_downcast::<gtk::Button>().unwrap();
+			cancel.set_visible(matches!(data.state, ItemState::Queued | ItemState::Active));
 
 			name.set_text(&data.name);
 			name.set_tooltip_text(Some(&data.name));
@@ -1036,6 +1075,12 @@ impl BrowserPage {
 				ItemState::Failed => {
 					status.set_text("Failed");
 					status.add_css_class("error");
+					bar.set_text(Some(""));
+				}
+				ItemState::Cancelled => {
+					status.set_text("Cancelled");
+					status.add_css_class("dim-label");
+					bar.set_fraction(0.0);
 					bar.set_text(Some(""));
 				}
 			}

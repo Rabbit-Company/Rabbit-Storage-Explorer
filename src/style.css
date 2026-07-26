@@ -45,3 +45,7 @@ progressbar.stalled > trough > progress,
 .transfers-list.stalled progressbar > trough > progress {
 	background-color: @warning_bg_color;
 }
+
+.transfers-list button.circular:hover {
+	color: @error_color;
+}

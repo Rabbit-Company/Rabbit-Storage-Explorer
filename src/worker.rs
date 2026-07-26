@@ -53,6 +53,9 @@ pub enum Command {
 		dest_prefix: String,
 	},
 	CancelTransfers,
+	CancelFile {
+		id: u64,
+	},
 	SetSettings(Settings),
 }
 
@@ -65,12 +68,11 @@ pub enum TransferKind {
 /// Live progress of one in-flight file (for the transfer details dialog).
 #[derive(Clone, Debug)]
 pub struct FileProgress {
+	pub id: u64,
 	pub name: String,
 	pub kind: TransferKind,
 	pub done: u64,
 	pub total: u64,
-	/// Smoothed speed in bytes/second, measured worker-side over >= 1s
-	/// windows of the file's own transfer timeline.
 	pub speed_bps: f64,
 }
 
@@ -101,8 +103,7 @@ pub enum Event {
 		failed_files: u64,
 		bytes_done: u64,
 		files: Vec<FileProgress>,
-		/// Set when this event marks one file as finished: (kind, name, success).
-		finished: Option<(TransferKind, String, bool)>,
+		finished: Option<(u64, bool)>,
 	},
 	TransferFinished {
 		uploaded: u64,
@@ -264,6 +265,7 @@ async fn dispatch(cmd_rx: async_channel::Receiver<Command>, ev: async_channel::S
 			}
 
 			Command::CancelTransfers => hub.cancel_all(),
+			Command::CancelFile { id } => hub.cancel_file(id),
 
 			Command::Connect {
 				profile,
@@ -490,10 +492,12 @@ struct Progress {
 	start: Instant,
 	/// Milliseconds (since `start`) of the last emitted byte-progress event.
 	last_emit: AtomicU64,
-	active: StdMutex<HashMap<(TransferKind, String), FileTrack>>,
+	active: StdMutex<HashMap<u64, FileTrack>>,
 }
 
 struct FileTrack {
+	kind: TransferKind,
+	name: String,
 	done: u64,
 	total: u64,
 	speed_bps: f64,
@@ -519,10 +523,12 @@ impl Progress {
 		self.uploaded.load(Ordering::Relaxed) + self.downloaded.load(Ordering::Relaxed)
 	}
 
-	fn file_start(&self, kind: TransferKind, name: &str, total: u64) {
+	fn file_start(&self, id: u64, kind: TransferKind, name: &str, total: u64) {
 		self.active.lock().unwrap().insert(
-			(kind, name.to_string()),
+			id,
 			FileTrack {
+				kind,
+				name: name.to_string(),
 				done: 0,
 				total,
 				speed_bps: 0.0,
@@ -536,25 +542,21 @@ impl Progress {
 		let map = self.active.lock().unwrap();
 		let mut v: Vec<FileProgress> = map
 			.iter()
-			.map(|((kind, name), t)| FileProgress {
-				name: name.clone(),
-				kind: *kind,
+			.map(|(id, t)| FileProgress {
+				id: *id,
+				name: t.name.clone(),
+				kind: t.kind,
 				done: t.done,
 				total: t.total,
 				speed_bps: t.speed_bps,
 			})
 			.collect();
-		// Stable row order: group by kind, then name.
-		v.sort_by(|a, b| (a.kind as u8, a.name.as_str()).cmp(&(b.kind as u8, b.name.as_str())));
+		v.sort_by_key(|f| f.id);
 		v
 	}
 
-	async fn file_done(&self, kind: TransferKind, name: &str, ok: bool) {
-		self
-			.active
-			.lock()
-			.unwrap()
-			.remove(&(kind, name.to_string()));
+	async fn file_done(&self, id: u64, kind: TransferKind, ok: bool) {
+		self.active.lock().unwrap().remove(&id);
 		if ok {
 			match kind {
 				TransferKind::Upload => self.uploaded.fetch_add(1, Ordering::Relaxed),
@@ -570,21 +572,16 @@ impl Progress {
 				failed_files: self.failed.load(Ordering::Relaxed),
 				bytes_done: self.bytes.load(Ordering::Relaxed),
 				files: self.snapshot(),
-				finished: Some((kind, name.to_string(), ok)),
+				finished: Some((id, ok)),
 			})
 			.await;
 	}
 
 	/// Record transferred bytes and emit a progress event, throttled to at
 	/// most ~10 events/second.
-	fn tick(&self, kind: TransferKind, current: &str, n: u64) {
+	fn tick(&self, id: u64, n: u64) {
 		self.bytes.fetch_add(n, Ordering::Relaxed);
-		if let Some(entry) = self
-			.active
-			.lock()
-			.unwrap()
-			.get_mut(&(kind, current.to_string()))
-		{
+		if let Some(entry) = self.active.lock().unwrap().get_mut(&id) {
 			entry.done += n;
 			entry.window_bytes += n;
 			let elapsed = entry.window_start.elapsed().as_secs_f64();
@@ -617,10 +614,12 @@ impl Progress {
 		}
 	}
 
-	fn file_resume(&self, kind: TransferKind, name: &str, total: u64, already_done: u64) {
+	fn file_resume(&self, id: u64, kind: TransferKind, name: &str, total: u64, already_done: u64) {
 		self.active.lock().unwrap().insert(
-			(kind, name.to_string()),
+			id,
 			FileTrack {
+				kind,
+				name: name.to_string(),
 				done: already_done,
 				total,
 				speed_bps: 0.0,
@@ -661,6 +660,8 @@ struct Admission {
 struct TransferHub {
 	ev: async_channel::Sender<Event>,
 	state: StdMutex<BatchState>,
+	file_cancels: StdMutex<HashMap<u64, CancellationToken>>,
+	next_id: AtomicU64,
 }
 
 impl TransferHub {
@@ -679,11 +680,33 @@ impl TransferHub {
 		Arc::new(Self {
 			ev,
 			state: StdMutex::new(state),
+			file_cancels: StdMutex::new(HashMap::new()),
+			next_id: AtomicU64::new(0),
 		})
+	}
+
+	fn next_id(&self) -> u64 {
+		self.next_id.fetch_add(1, Ordering::Relaxed)
+	}
+
+	fn register_file(&self, id: u64, parent: &CancellationToken) -> CancellationToken {
+		let token = parent.child_token();
+		self.file_cancels.lock().unwrap().insert(id, token.clone());
+		token
+	}
+
+	fn cancel_file(&self, id: u64) {
+		if let Some(t) = self.file_cancels.lock().unwrap().get(&id) {
+			t.cancel();
+		}
 	}
 
 	fn cancel_all(&self) {
 		self.state.lock().unwrap().cancel.cancel();
+	}
+
+	fn unregister_file(&self, id: u64) {
+		self.file_cancels.lock().unwrap().remove(&id);
 	}
 
 	/// Register `count` files (`bytes` total) into the running batch, opening a
@@ -702,6 +725,7 @@ impl TransferHub {
 			st.upload_sem = Arc::new(Semaphore::new(settings.upload_parallelism.max(1)));
 			st.download_sem = Arc::new(Semaphore::new(settings.download_parallelism.max(1)));
 			st.cancel = CancellationToken::new();
+			self.file_cancels.lock().unwrap().clear();
 		}
 		st.outstanding += count;
 		st.total_files += count;
@@ -795,10 +819,15 @@ async fn run_upload(
 		let _ = ev.send(Event::Toast("Nothing to upload".into())).await;
 		return;
 	}
-	let total_bytes: u64 = files.iter().map(|(_, _, size)| *size).sum();
-	let roster: Vec<FileProgress> = files
+	let items: Vec<(u64, PathBuf, String, u64)> = files
+		.into_iter()
+		.map(|(path, rel, size)| (hub.next_id(), path, rel, size))
+		.collect();
+	let total_bytes: u64 = items.iter().map(|(_, _, _, size)| *size).sum();
+	let roster: Vec<FileProgress> = items
 		.iter()
-		.map(|(_, rel, size)| FileProgress {
+		.map(|(id, _, rel, size)| FileProgress {
+			id: *id,
 			name: rel.clone(),
 			kind: TransferKind::Upload,
 			done: 0,
@@ -807,7 +836,7 @@ async fn run_upload(
 		})
 		.collect();
 
-	let a = hub.admit(&st, files.len() as u64, total_bytes);
+	let a = hub.admit(&st, items.len() as u64, total_bytes);
 	let _ = ev
 		.send(if a.fresh {
 			Event::TransferStarted {
@@ -824,7 +853,8 @@ async fn run_upload(
 		})
 		.await;
 
-	for (path, rel, _size) in files {
+	for (id, path, rel, _size) in items {
+		let file_cancel = hub.register_file(id, &a.cancel);
 		let (s, st, sem, progress, errors, cancel, hub) = (
 			s.clone(),
 			st.clone(),
@@ -837,17 +867,32 @@ async fn run_upload(
 		let dest_prefix = dest_prefix.clone();
 		tokio::spawn(async move {
 			let _permit = sem.acquire_owned().await.ok();
-			if !cancel.is_cancelled() {
-				match upload_one(&s, &st, &path, &dest_prefix, &rel, &progress, &cancel).await {
-					Ok(()) => progress.file_done(TransferKind::Upload, &rel, true).await,
+			if !file_cancel.is_cancelled() {
+				match upload_one(
+					&s,
+					&st,
+					&path,
+					&dest_prefix,
+					id,
+					&rel,
+					&progress,
+					&file_cancel,
+				)
+				.await
+				{
+					Ok(()) => progress.file_done(id, TransferKind::Upload, true).await,
 					Err(e) => {
-						if !cancel.is_cancelled() {
+						if !file_cancel.is_cancelled() {
 							errors.lock().await.push(format!("{rel}: {e:#}"));
 						}
-						progress.file_done(TransferKind::Upload, &rel, false).await;
+						progress.file_done(id, TransferKind::Upload, false).await;
 					}
 				}
+			} else if !cancel.is_cancelled() {
+				// Per-file cancel while queued: settle the row. Batch cancel skips this.
+				progress.file_done(id, TransferKind::Upload, false).await;
 			}
+			hub.unregister_file(id);
 			hub.task_done().await;
 		});
 	}
@@ -858,6 +903,7 @@ async fn upload_one(
 	st: &Settings,
 	path: &PathBuf,
 	dest_prefix: &str,
+	id: u64,
 	rel: &str,
 	progress: &Progress,
 	cancel: &CancellationToken,
@@ -875,14 +921,14 @@ async fn upload_one(
 		if cancel.is_cancelled() {
 			return Err(anyhow!("cancelled"));
 		}
-		progress.file_start(TransferKind::Upload, rel, plain_len);
+		progress.file_start(id, TransferKind::Upload, rel, plain_len);
 		let result = async {
 			let backend = s.backend().await;
 			backend.prepare_parents(&key).await?;
 			if plain_len <= threshold {
-				upload_small(s, &backend, path, &key, rel, plain_len, progress).await
+				upload_small(s, &backend, path, &key, id, plain_len, progress).await
 			} else {
-				upload_multipart(s, &backend, st, path, &key, rel, progress, cancel).await
+				upload_multipart(s, &backend, st, path, &key, id, progress, cancel).await
 			}
 		}
 		.await;
@@ -903,7 +949,7 @@ async fn upload_small(
 	backend: &Arc<dyn StorageBackend>,
 	path: &PathBuf,
 	key: &str,
-	name: &str,
+	id: u64,
 	plain_len: u64,
 	progress: &Progress,
 ) -> Result<()> {
@@ -913,7 +959,7 @@ async fn upload_small(
 		None => data,
 	};
 	backend.put(key, body).await?;
-	progress.tick(TransferKind::Upload, name, plain_len);
+	progress.tick(id, plain_len);
 	Ok(())
 }
 
@@ -923,7 +969,7 @@ async fn upload_multipart(
 	st: &Settings,
 	path: &PathBuf,
 	key: &str,
-	name: &str,
+	id: u64,
 	progress: &Progress,
 	cancel: &CancellationToken,
 ) -> Result<()> {
@@ -967,7 +1013,7 @@ async fn upload_multipart(
 				Some(enc) => part_buf.extend(enc.seal_chunk(&chunk[..filled], last)?),
 				None => part_buf.extend_from_slice(&chunk[..filled]),
 			}
-			progress.tick(TransferKind::Upload, name, filled as u64);
+			progress.tick(id, filled as u64);
 
 			if part_buf.len() >= part_size || last {
 				let data = std::mem::take(&mut part_buf);
@@ -1033,10 +1079,15 @@ async fn run_download(
 		return;
 	}
 
-	let total_bytes: u64 = targets.iter().map(|(_, _, s)| *s).sum();
-	let roster: Vec<FileProgress> = targets
+	let items: Vec<(u64, String, String, u64)> = targets
+		.into_iter()
+		.map(|(key, rel, size)| (hub.next_id(), key, rel, size))
+		.collect();
+	let total_bytes: u64 = items.iter().map(|(_, _, _, s)| *s).sum();
+	let roster: Vec<FileProgress> = items
 		.iter()
-		.map(|(_, rel, size)| FileProgress {
+		.map(|(id, _, rel, size)| FileProgress {
+			id: *id,
 			name: rel.clone(),
 			kind: TransferKind::Download,
 			done: 0,
@@ -1045,7 +1096,7 @@ async fn run_download(
 		})
 		.collect();
 
-	let a = hub.admit(&st, targets.len() as u64, total_bytes);
+	let a = hub.admit(&st, items.len() as u64, total_bytes);
 	let _ = ev
 		.send(if a.fresh {
 			Event::TransferStarted {
@@ -1062,7 +1113,8 @@ async fn run_download(
 		})
 		.await;
 
-	for (key, rel, size) in targets {
+	for (id, key, rel, size) in items {
+		let file_cancel = hub.register_file(id, &a.cancel);
 		let (s, st, sem, progress, errors, cancel, dest, hub) = (
 			s.clone(),
 			st.clone(),
@@ -1075,34 +1127,34 @@ async fn run_download(
 		);
 		tokio::spawn(async move {
 			let _permit = sem.acquire_owned().await.ok();
-			if !cancel.is_cancelled() {
+			if !file_cancel.is_cancelled() {
 				let out_path = dest.join(sanitize_rel(&rel));
 				let mut attempt = 0u32;
 				let result = loop {
-					match download_one(&s, &key, &rel, size, &out_path, &progress, &cancel).await {
+					match download_one(&s, &key, id, &rel, size, &out_path, &progress, &file_cancel).await {
 						Ok(()) => break Ok(()),
-						Err(_) if attempt < st.retries && !cancel.is_cancelled() => {
+						Err(_) if attempt < st.retries && !file_cancel.is_cancelled() => {
 							attempt += 1;
-							s.wait_until_healthy(&cancel).await;
+							s.wait_until_healthy(&file_cancel).await;
 							tokio::time::sleep(Duration::from_millis(400 * (1 << attempt.min(4)))).await;
 						}
 						Err(e) => break Err(e),
 					}
 				};
 				match result {
-					Ok(()) => progress.file_done(TransferKind::Download, &rel, true).await,
+					Ok(()) => progress.file_done(id, TransferKind::Download, true).await,
 					Err(e) => {
-						// Gave up (or cancelled): don't leave a stray .rse-part.
 						let _ = tokio::fs::remove_file(part_path(&out_path)).await;
-						if !cancel.is_cancelled() {
+						if !file_cancel.is_cancelled() {
 							errors.lock().await.push(format!("{rel}: {e:#}"));
 						}
-						progress
-							.file_done(TransferKind::Download, &rel, false)
-							.await;
+						progress.file_done(id, TransferKind::Download, false).await;
 					}
 				}
+			} else if !cancel.is_cancelled() {
+				progress.file_done(id, TransferKind::Download, false).await;
 			}
+			hub.unregister_file(id);
 			hub.task_done().await;
 		});
 	}
@@ -1131,6 +1183,7 @@ fn part_path(out_path: &std::path::Path) -> PathBuf {
 async fn download_one(
 	s: &Session,
 	key: &str,
+	id: u64,
 	name: &str,
 	expected_len: u64,
 	out_path: &PathBuf,
@@ -1207,9 +1260,15 @@ async fn download_one(
 		.await?;
 
 	if done_plain > 0 {
-		progress.file_resume(TransferKind::Download, name, plaintext_total, done_plain);
+		progress.file_resume(
+			id,
+			TransferKind::Download,
+			name,
+			plaintext_total,
+			done_plain,
+		);
 	} else {
-		progress.file_start(TransferKind::Download, name, plaintext_total);
+		progress.file_start(id, TransferKind::Download, name, plaintext_total);
 	}
 
 	let result: Result<()> = async {
@@ -1226,7 +1285,7 @@ async fn download_one(
 						break;
 					}
 					file.write_all(&buf[..n]).await?;
-					progress.tick(TransferKind::Download, name, n as u64);
+					progress.tick(id, n as u64);
 				}
 				file.flush().await?;
 			}
@@ -1263,7 +1322,7 @@ async fn download_one(
 					}
 					let plain = dec.open_chunk(&buf[..clen], last)?;
 					file.write_all(&plain).await?;
-					progress.tick(TransferKind::Download, name, plain.len() as u64);
+					progress.tick(id, plain.len() as u64);
 				}
 				file.flush().await?;
 			}
