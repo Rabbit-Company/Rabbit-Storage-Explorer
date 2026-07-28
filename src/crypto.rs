@@ -36,6 +36,7 @@ pub const CIPHER_CHUNK: usize = CHUNK + TAG;
 const LAST_FLAG: u32 = 0x8000_0000;
 const CANARY: &[u8] = b"rse canary v1";
 const NAME_HEADER: &[u8] = b"rse-name-v1";
+const NAME_PAD_BLOCK: usize = 16;
 
 /// Key material derived from the user's password. Zeroized on drop.
 #[derive(Zeroize, ZeroizeOnDrop)]
@@ -206,10 +207,36 @@ pub fn decrypt_bytes(keys: &VaultKeys, blob: &[u8]) -> Result<Vec<u8>> {
 	Ok(out)
 }
 
+fn pad_name(name: &[u8]) -> Result<Vec<u8>> {
+	if name.len() > u16::MAX as usize {
+		bail!("filename too long to encrypt");
+	}
+	let body = 2 + name.len();
+	let padded = body.div_ceil(NAME_PAD_BLOCK) * NAME_PAD_BLOCK;
+	let mut out = Vec::with_capacity(padded);
+	out.extend_from_slice(&(name.len() as u16).to_be_bytes());
+	out.extend_from_slice(name);
+	out.resize(padded, 0);
+	Ok(out)
+}
+
+fn unpad_name(padded: &[u8]) -> Result<Vec<u8>> {
+	if padded.len() < 2 {
+		bail!("encrypted name too short");
+	}
+	let len = u16::from_be_bytes([padded[0], padded[1]]) as usize;
+	let end = 2 + len;
+	if end > padded.len() {
+		bail!("encrypted name has invalid length prefix");
+	}
+	Ok(padded[2..end].to_vec())
+}
+
 pub fn encrypt_name(keys: &VaultKeys, name: &str) -> Result<String> {
 	let mut siv = Aes256Siv::new_from_slice(&keys.name).map_err(|_| anyhow!("bad name key"))?;
+	let padded = pad_name(name.as_bytes())?;
 	let ct = siv
-		.encrypt([NAME_HEADER], name.as_bytes())
+		.encrypt([NAME_HEADER], &padded)
 		.map_err(|_| anyhow!("name encryption failed"))?;
 	Ok(BASE32HEX_NOPAD.encode(&ct))
 }
@@ -219,12 +246,14 @@ pub fn decrypt_name(keys: &VaultKeys, encoded: &str) -> Result<String> {
 		.decode(encoded.as_bytes())
 		.context("not an encrypted name")?;
 	let mut siv = Aes256Siv::new_from_slice(&keys.name).map_err(|_| anyhow!("bad name key"))?;
-	let pt = siv
+	let padded = siv
 		.decrypt([NAME_HEADER], &ct)
 		.map_err(|_| anyhow!("name decryption failed"))?;
+	let pt = unpad_name(&padded)?;
 	String::from_utf8(pt).context("decrypted name is not UTF-8")
 }
 
+#[allow(unused)]
 /// Encrypt every segment of a `/`-separated key path. Trailing `/` preserved.
 pub fn encrypt_path(keys: &VaultKeys, path: &str) -> Result<String> {
 	map_segments(path, |s| encrypt_name(keys, s))
@@ -414,5 +443,44 @@ mod tests {
 		assert!(dec
 			.open_chunk(&ct[HEADER_LEN..HEADER_LEN + CIPHER_CHUNK], false)
 			.is_err());
+	}
+
+	#[test]
+	fn name_padding_roundtrips() {
+		// Boundary cases around the 16-byte block, plus a long name.
+		for len in [0usize, 1, 13, 14, 15, 16, 17, 100] {
+			let name = vec![b'x'; len];
+			let padded = pad_name(&name).unwrap();
+			assert_eq!(padded.len() % NAME_PAD_BLOCK, 0);
+			assert!(padded.len() >= 2 + name.len());
+			assert_eq!(unpad_name(&padded).unwrap(), name);
+		}
+	}
+
+	#[test]
+	fn name_length_is_bucketed() {
+		let k = keys();
+		// Different real lengths that land in the same 16-byte bucket must
+		// produce identical-length ciphertext (so exact length no longer leaks).
+		let a = encrypt_name(&k, "a").unwrap(); // 1 byte
+		let b = encrypt_name(&k, "vacation.jpg").unwrap(); // 12 bytes
+		assert_eq!(a.len(), b.len());
+
+		// A name in the next bucket up must be strictly longer.
+		let long = encrypt_name(&k, "a-considerably-longer-file-name.tar.gz").unwrap();
+		assert!(long.len() > b.len());
+	}
+
+	#[test]
+	fn padded_names_still_roundtrip() {
+		let k = keys();
+		// Multibyte UTF-8 and an empty-ish name survive the pad/encrypt/decrypt
+		// path, and encryption stays deterministic.
+		for name in ["ä", "häppy file (1).svg", "x"] {
+			let enc = encrypt_name(&k, name).unwrap();
+			assert!(!enc.contains('/'));
+			assert_eq!(decrypt_name(&k, &enc).unwrap(), name);
+			assert_eq!(enc, encrypt_name(&k, name).unwrap()); // deterministic
+		}
 	}
 }

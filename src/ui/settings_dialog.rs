@@ -39,10 +39,18 @@ pub fn present(
 		600.0,
 		current.reconnect_interval_secs as f64,
 	);
+	let flush = spin_row(
+		"Manifest flush interval (seconds)",
+		"How often encrypted directory metadata is saved back",
+		1.0,
+		300.0,
+		current.manifest_flush_secs as f64,
+	);
 	transfers.add(&up);
 	transfers.add(&down);
 	transfers.add(&retries);
 	transfers.add(&reconnect);
+	transfers.add(&flush);
 
 	let large = adw::PreferencesGroup::builder()
 		.title("Large files")
@@ -80,6 +88,7 @@ pub fn present(
 			multipart_threshold_mib: threshold.value() as u64,
 			part_size_mib: part.value() as u64,
 			reconnect_interval_secs: reconnect.value() as u64,
+			manifest_flush_secs: flush.value() as u64,
 		});
 	});
 

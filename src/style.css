@@ -49,3 +49,25 @@ progressbar.stalled > trough > progress,
 .transfers-list button.circular:hover {
 	color: @error_color;
 }
+
+.info-hero {
+	margin-bottom: 4px;
+}
+
+.info-card {
+	padding: 14px 16px;
+	border-radius: 12px;
+}
+
+.info-card .title-2 {
+	margin-top: 2px;
+}
+
+.info-card-accent {
+	background: alpha(@accent_bg_color, 0.12);
+	border: 1px solid alpha(@accent_bg_color, 0.35);
+}
+
+.info-card-accent .title-2 {
+	color: @accent_color;
+}

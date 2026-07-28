@@ -5,6 +5,9 @@
 //! thread only exchanges messages over `async-channel`, so the UI can never stall.
 
 use crate::crypto::{self, VaultKeys};
+use crate::dir_view;
+use crate::manifest;
+use crate::manifest_store::{FlushReason, ManifestStore};
 use crate::settings::{BackendKind, ConnectionProfile, Settings};
 use crate::storage::ProgressSink;
 use crate::storage::{
@@ -52,6 +55,22 @@ pub enum Command {
 	Move {
 		items: Vec<RemoteEntry>,
 		dest_prefix: String,
+	},
+	Rename {
+		key: String,
+		is_dir: bool,
+		old_name: String,
+		new_name: String,
+		encrypted: bool,
+	},
+	CalculateSize {
+		key: String,
+		name: String,
+		encrypted: bool,
+	},
+	FolderInfo {
+		key: String,
+		name: String,
 	},
 	CancelTransfers,
 	CancelFile {
@@ -118,8 +137,37 @@ pub enum Event {
 	Moved {
 		count: u64,
 	},
+	Renamed,
+	SizeCalculated {
+		plaintext: u64,
+		encrypted: u64,
+	},
 	FolderCreated,
 	Toast(String),
+	FolderInfo(FolderInfo),
+}
+
+/// One file's sizes for the folder Info modal.
+#[derive(Clone, Debug)]
+pub struct FileInfo {
+	/// Path relative to the inspected folder (real, decrypted names).
+	pub rel_path: String,
+	pub plaintext: u64,
+	pub encrypted: u64,
+}
+
+/// Full breakdown of an encrypted folder, for the Info modal.
+#[derive(Clone, Debug)]
+pub struct FolderInfo {
+	pub name: String,
+	pub file_count: u64,
+	pub folder_count: u64,
+	pub plaintext_total: u64,
+	pub encrypted_total: u64,
+	/// Unix-millis of the last cached size computation, if any.
+	pub computed: Option<i64>,
+	/// Per-file rows (already sorted largest-first), capped for the UI.
+	pub files: Vec<FileInfo>,
 }
 
 /// Spawn the worker thread. Returns the command sender and event receiver
@@ -149,6 +197,7 @@ pub fn spawn() -> (
 struct Session {
 	keys: Option<Arc<VaultKeys>>,
 	conn: Arc<Conn>,
+	store: ManifestStore,
 }
 
 struct Conn {
@@ -243,8 +292,33 @@ async fn connect_backend(
 	})
 }
 
+/// Periodically flush dirty manifests, and do a final forced flush when stopped
+/// (disconnect / reconnect / app close). No-op for non-E2EE sessions.
+fn spawn_flush_timer(s: Session) -> CancellationToken {
+	let token = CancellationToken::new();
+	let stop = token.clone();
+	tokio::spawn(async move {
+		let Some(keys) = s.keys.clone() else { return };
+		loop {
+			tokio::select! {
+				_ = stop.cancelled() => {
+					let backend = s.backend().await;
+					let _ = s.store.flush(&backend, &keys, FlushReason::Forced).await;
+					return;
+				}
+				_ = tokio::time::sleep(s.store.interval()) => {
+					let backend = s.backend().await;
+					let _ = s.store.flush(&backend, &keys, FlushReason::Timer).await;
+				}
+			}
+		}
+	});
+	token
+}
+
 async fn dispatch(cmd_rx: async_channel::Receiver<Command>, ev: async_channel::Sender<Event>) {
 	let mut session: Option<Session> = None;
+	let mut manifest_timer: Option<CancellationToken> = None;
 	let mut settings = Settings::load();
 	let hub = TransferHub::new(ev.clone());
 
@@ -256,11 +330,17 @@ async fn dispatch(cmd_rx: async_channel::Receiver<Command>, ev: async_channel::S
 						.conn
 						.reconnect_interval_ms
 						.store(s.reconnect_interval_secs.max(1) * 1000, Ordering::Relaxed);
+					sess
+						.store
+						.set_interval(std::time::Duration::from_secs(s.manifest_flush_secs.max(1)));
 				}
 				settings = s;
 			}
 
 			Command::Disconnect => {
+				if let Some(t) = manifest_timer.take() {
+					t.cancel();
+				}
 				hub.cancel_all();
 				session = None;
 			}
@@ -282,8 +362,14 @@ async fn dispatch(cmd_rx: async_channel::Receiver<Command>, ev: async_channel::S
 			.await
 			{
 				Ok(s) => {
+					if let Some(t) = manifest_timer.take() {
+						t.cancel();
+					}
 					let e2ee = s.keys.is_some();
 					session = Some(s);
+					if let Some(sess) = &session {
+						manifest_timer = Some(spawn_flush_timer(sess.clone()));
+					}
 					let label = match profile.kind {
 						BackendKind::S3 => profile.bucket.clone(),
 						BackendKind::Sftp => format!("{}@{}", profile.username, profile.host),
@@ -391,6 +477,87 @@ async fn dispatch(cmd_rx: async_channel::Receiver<Command>, ev: async_channel::S
 					}
 				});
 			}
+
+			Command::Rename {
+				key,
+				is_dir,
+				old_name,
+				new_name,
+				encrypted,
+			} => {
+				let Some(s) = session.clone() else { continue };
+				let ev = ev.clone();
+				tokio::spawn(async move {
+					let mut result = run_rename(&s, &key, is_dir, &old_name, &new_name, encrypted).await;
+					if result.is_err() {
+						s.wait_until_healthy(&CancellationToken::new()).await;
+						result = run_rename(&s, &key, is_dir, &old_name, &new_name, encrypted).await;
+					}
+					match result {
+						Ok(()) => {
+							let _ = ev.send(Event::Renamed).await;
+						}
+						Err(e) => {
+							let _ = ev.send(Event::Toast(format!("Rename failed: {e:#}"))).await;
+						}
+					}
+				});
+			}
+
+			Command::CalculateSize {
+				key,
+				name,
+				encrypted,
+			} => {
+				let Some(s) = session.clone() else { continue };
+				let ev = ev.clone();
+				tokio::spawn(async move {
+					let mut result = run_calculate_size(&s, &key, &name, encrypted).await;
+					if result.is_err() {
+						s.wait_until_healthy(&CancellationToken::new()).await;
+						result = run_calculate_size(&s, &key, &name, encrypted).await;
+					}
+					match result {
+						Ok((plaintext, encrypted)) => {
+							let _ = ev
+								.send(Event::SizeCalculated {
+									plaintext,
+									encrypted,
+								})
+								.await;
+						}
+						Err(e) => {
+							let _ = ev
+								.send(Event::Toast(format!(
+									"Size calculation for \"{name}\" failed: {e:#}"
+								)))
+								.await;
+						}
+					}
+				});
+			}
+
+			Command::FolderInfo { key, name } => {
+				let Some(s) = session.clone() else { continue };
+				let ev = ev.clone();
+				tokio::spawn(async move {
+					let mut result = collect_folder_info(&s, &key, &name).await;
+					if result.is_err() {
+						s.wait_until_healthy(&CancellationToken::new()).await;
+						result = collect_folder_info(&s, &key, &name).await;
+					}
+					match result {
+						Ok(info) => {
+							let _ = ev.send(Event::FolderInfo(info)).await;
+						}
+						Err(e) => {
+							let _ = ev
+								.send(Event::Toast(format!("Reading folder info failed: {e:#}")))
+								.await;
+						}
+					}
+				});
+			}
 		}
 	}
 }
@@ -437,6 +604,7 @@ async fn connect(
 
 	Ok(Session {
 		keys,
+		store: ManifestStore::new(std::time::Duration::from_secs(10)),
 		conn: Arc::new(Conn {
 			profile: profile.clone(),
 			secret: secret.to_string(),
@@ -450,18 +618,46 @@ async fn connect(
 }
 
 async fn list(s: &Session, prefix: &str) -> Result<Vec<RemoteEntry>> {
-	let raw = s.backend().await.list(prefix).await?;
-	let mut entries: Vec<RemoteEntry> = raw
+	let backend = s.backend().await;
+	let raw: Vec<RawObject> = backend
+		.list(prefix)
+		.await?
 		.into_iter()
-		.filter(|o| o.key.trim_end_matches('/').rsplit('/').next() != Some(crypto::VAULT_KEY))
-		.map(|o| raw_to_entry(o, s.keys.as_deref()))
+		.filter(|o| {
+			let leaf = o.key.trim_end_matches('/').rsplit('/').next().unwrap_or("");
+			leaf != crypto::VAULT_KEY // vault metadata is never a user entry
+		})
 		.collect();
-	entries.sort_by(|a, b| {
-		b.is_dir
-			.cmp(&a.is_dir)
-			.then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-	});
-	Ok(entries)
+
+	match s.keys.as_deref() {
+		Some(keys) => {
+			// One manifest read (buffered) resolves every hash-named entry in the
+			// directory to its real name + plaintext size, hides `.rse`, and
+			// surfaces orphans.
+			let manifest = s.store.load(&backend, keys, prefix).await?;
+			let listing = dir_view::build_listing(raw, &manifest);
+			if listing.orphan_count > 0 {
+				let _ = s
+					.conn
+					.ev
+					.send(Event::Toast(format!(
+						"{} item(s) here lost their names (interrupted upload); re-upload to restore",
+						listing.orphan_count
+					)))
+					.await;
+			}
+			Ok(listing.entries)
+		}
+		None => {
+			let mut entries: Vec<RemoteEntry> = raw.into_iter().map(|o| raw_to_entry(o, None)).collect();
+			entries.sort_by(|a, b| {
+				b.is_dir
+					.cmp(&a.is_dir)
+					.then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+			});
+			Ok(entries)
+		}
+	}
 }
 
 fn raw_to_entry(o: RawObject, keys: Option<&VaultKeys>) -> RemoteEntry {
@@ -813,6 +1009,45 @@ fn wire_len(plain: u64) -> u64 {
 	crypto::HEADER_LEN as u64 + plain + n_chunks * crypto::TAG as u64
 }
 
+/// After a file lands, record it (and any parent folders created by its relative
+/// path) in the buffered manifests. Non-fatal: the bytes are already uploaded, so
+/// a manifest hiccup just leaves a recoverable orphan.
+async fn record_upload(s: &Session, dest_prefix: &str, rel: &str, plaintext_size: u64) {
+	let Some(keys) = s.keys.as_deref() else {
+		return;
+	};
+	let backend = s.backend().await;
+	let segments: Vec<&str> = rel.split('/').filter(|x| !x.is_empty()).collect();
+	let mut prefix = dest_prefix.to_string();
+	for (i, seg) in segments.iter().enumerate() {
+		let Ok(enc) = crypto::encrypt_name(keys, seg) else {
+			return;
+		};
+		let hash = manifest::hash_entry(&enc);
+		let last = i + 1 == segments.len();
+		let (enc_c, seg_c) = (enc.clone(), seg.to_string());
+		let res = if last {
+			s.store
+				.edit(&backend, keys, &prefix, move |m| {
+					m.upsert_file(&enc_c, &seg_c, plaintext_size)
+				})
+				.await
+		} else {
+			s.store
+				.edit(&backend, keys, &prefix, move |m| {
+					m.upsert_folder(&enc_c, &seg_c)
+				})
+				.await
+		};
+		if res.is_err() {
+			return;
+		}
+		if !last {
+			prefix = format!("{prefix}{hash}/");
+		}
+	}
+}
+
 async fn run_upload(
 	hub: Arc<TransferHub>,
 	s: Session,
@@ -876,7 +1111,8 @@ async fn run_upload(
 		})
 		.await;
 
-	for (id, path, rel, _size) in items {
+	let mut task_handles = Vec::new();
+	for (id, path, rel, size) in items {
 		let file_cancel = hub.register_file(id, &a.cancel);
 		let (s, st, sem, progress, errors, cancel, hub) = (
 			s.clone(),
@@ -888,7 +1124,7 @@ async fn run_upload(
 			hub.clone(),
 		);
 		let dest_prefix = dest_prefix.clone();
-		tokio::spawn(async move {
+		task_handles.push(tokio::spawn(async move {
 			let _permit = sem.acquire_owned().await.ok();
 			if !file_cancel.is_cancelled() {
 				match upload_one(
@@ -903,7 +1139,10 @@ async fn run_upload(
 				)
 				.await
 				{
-					Ok(()) => progress.file_done(id, TransferKind::Upload, true).await,
+					Ok(()) => {
+						record_upload(&s, &dest_prefix, &rel, size).await;
+						progress.file_done(id, TransferKind::Upload, true).await
+					}
 					Err(e) => {
 						if !file_cancel.is_cancelled() {
 							errors.lock().await.push(format!("{rel}: {e:#}"));
@@ -917,6 +1156,17 @@ async fn run_upload(
 			}
 			hub.unregister_file(id);
 			hub.task_done().await;
+		}));
+	}
+
+	if let Some(keys) = s.keys.clone() {
+		let (s2, handles) = (s.clone(), std::mem::take(&mut task_handles));
+		tokio::spawn(async move {
+			for h in handles {
+				let _ = h.await;
+			}
+			let backend = s2.backend().await;
+			let _ = s2.store.flush(&backend, &keys, FlushReason::Forced).await;
 		});
 	}
 }
@@ -932,7 +1182,7 @@ async fn upload_one(
 	cancel: &CancellationToken,
 ) -> Result<()> {
 	let key = match s.keys.as_deref() {
-		Some(k) => format!("{dest_prefix}{}", crypto::encrypt_path(k, rel)?),
+		Some(k) => format!("{dest_prefix}{}", dir_view::on_disk_path(k, rel)?),
 		None => format!("{dest_prefix}{rel}"),
 	};
 
@@ -1254,15 +1504,16 @@ async fn download_one(
 		}
 	}
 
-	// Plaintext size, for the completion check and the progress row total.
-	let plaintext_total = if encrypted {
-		let (n_chunks, _last) = crypto::chunk_layout(expected_len)?;
-		expected_len
-			.saturating_sub(crypto::HEADER_LEN as u64)
-			.saturating_sub(n_chunks * crypto::TAG as u64)
+	let cipher_len = if encrypted {
+		crypto::encrypted_size(expected_len)
 	} else {
 		expected_len
 	};
+
+	// Plaintext size, for the completion check and the progress row total.
+	// (For plain files the on-disk size is the plaintext size; for encrypted
+	// files the caller passes the manifest plaintext size directly.)
+	let plaintext_total = expected_len;
 
 	// Already complete (e.g. crashed between flush and rename): just finalize.
 	if done_plain > 0 && done_plain >= plaintext_total {
@@ -1328,7 +1579,7 @@ async fn download_one(
 				file.flush().await?;
 			}
 			Some(keys) => {
-				let (n_chunks, last_len) = crypto::chunk_layout(expected_len)?;
+				let (n_chunks, last_len) = crypto::chunk_layout(cipher_len)?;
 				let completed = done_plain / crypto::CHUNK as u64;
 
 				// The file nonce lives in the 12-byte header. When resuming we
@@ -1408,28 +1659,36 @@ fn sanitize_rel(rel: &str) -> PathBuf {
 		.collect()
 }
 
-/// Create an empty directory. Object stores have no directories, so a
-/// zero-byte marker object with a trailing-slash key stands in - it groups
-/// into a common prefix in listings. Filesystem-like backends get a real
-/// directory via `prepare_parents`.
 async fn create_folder(s: &Session, prefix: &str, name: &str) -> Result<()> {
-	let segment = match &s.keys {
-		Some(k) => crypto::encrypt_name(k, name)?,
-		None => name.to_string(),
+	let (segment, enc) = match &s.keys {
+		Some(k) => {
+			let enc = crypto::encrypt_name(k, name)?;
+			(manifest::hash_entry(&enc), Some(enc))
+		}
+		None => (name.to_string(), None),
 	};
 	let key = format!("{prefix}{segment}/");
 	let backend = s.backend().await;
 	if s.conn.profile.kind == BackendKind::S3 {
-		backend.put(&key, Vec::new()).await
+		backend.put(&key, Vec::new()).await?;
 	} else {
-		// Creating the parents of "<key>x" creates <key> itself.
-		backend.prepare_parents(&format!("{key}x")).await
+		backend.prepare_parents(&format!("{key}x")).await?;
 	}
+	if let (Some(keys), Some(enc)) = (s.keys.as_deref(), enc) {
+		let (enc_c, name_c) = (enc, name.to_string());
+		s.store
+			.edit(&backend, keys, prefix, move |m| {
+				m.upsert_folder(&enc_c, &name_c)
+			})
+			.await?;
+		s.store.flush(&backend, keys, FlushReason::Forced).await?;
+	}
+	Ok(())
 }
 
 async fn run_delete(s: &Session, items: Vec<RemoteEntry>) -> Result<u64> {
 	let mut keys = Vec::new();
-	for item in items {
+	for item in items.clone() {
 		if item.is_dir {
 			for o in s.backend().await.list_recursive(&item.key).await? {
 				keys.push(o.key);
@@ -1441,6 +1700,29 @@ async fn run_delete(s: &Session, items: Vec<RemoteEntry>) -> Result<u64> {
 	}
 	let n = keys.len() as u64;
 	s.backend().await.delete(keys).await?;
+
+	if let Some(keys) = s.keys.as_deref() {
+		let backend = s.backend().await;
+		for item in &items {
+			// parent prefix of item.key, and the item's encrypted leaf name
+			let parent = parent_prefix(&item.key);
+			if let Ok(enc) = crypto::encrypt_name(keys, &item.name) {
+				let enc_c = enc.clone();
+				let _ = s
+					.store
+					.edit(&backend, keys, &parent, move |m| {
+						m.remove(&enc_c);
+					})
+					.await;
+			}
+			// If a whole folder was deleted, forget its buffered manifest too.
+			if item.is_dir {
+				s.store.forget(item.key.trim_end_matches('/')).await;
+			}
+		}
+		let _ = s.store.flush(&backend, keys, FlushReason::Forced).await;
+	}
+
 	Ok(n)
 }
 
@@ -1472,6 +1754,292 @@ async fn run_move(s: &Session, items: Vec<RemoteEntry>, dest_prefix: &str) -> Re
 			backend.rename(&item.key, &to).await?;
 		}
 		moved += 1;
+
+		if let Some(keys) = s.keys.as_deref() {
+			let src_parent = parent_prefix(&item.key);
+			if let Ok(enc) = crypto::encrypt_name(keys, &item.name) {
+				// A move preserves the name, so the encrypted segment (and thus the
+				// on-disk hash) is identical in source and destination: take the
+				// record out of the source manifest and re-insert it into the dest.
+				// The take/insert helpers hold the store lock internally, so nothing
+				// non-Send has to cross an await point.
+				if let Ok(Some(entry)) = s.store.take_entry(&backend, keys, &src_parent, &enc).await {
+					let _ = s
+						.store
+						.insert_entry(&backend, keys, dest_prefix, &enc, entry)
+						.await;
+				}
+			}
+		}
 	}
+
+	if let Some(keys) = s.keys.as_deref() {
+		let backend = s.backend().await;
+		let _ = s.store.flush(&backend, keys, FlushReason::Forced).await;
+	}
+
 	Ok(moved)
+}
+
+/// Rename one entry in place. Only the leaf segment changes; the parent prefix
+/// and (for folders) the whole subtree move with it via the backend's `rename`.
+async fn run_rename(
+	s: &Session,
+	key: &str,
+	is_dir: bool,
+	old_name: &str,
+	new_name: &str,
+	encrypted: bool,
+) -> Result<()> {
+	if new_name.trim().is_empty() || new_name.contains('/') {
+		return Err(anyhow!("invalid name"));
+	}
+	let backend = s.backend().await;
+	let parent = parent_prefix(key);
+
+	// Only a genuine E2EE item (hash-named + in the manifest) goes through the
+	// hashing/manifest path. A foreign or plaintext object - even inside an E2EE
+	// session - is renamed in place, keeping its literal on-disk name.
+	match (encrypted, s.keys.as_deref()) {
+		(true, Some(keys)) => {
+			// On-disk names are hash_entry(encrypt_name(..)); the real name lives
+			// in the parent's manifest. So a rename = move the object(s) from the
+			// old hash to the new hash, then re-key the manifest entry.
+			let old_enc = crypto::encrypt_name(keys, old_name)?;
+			let new_enc = crypto::encrypt_name(keys, new_name)?;
+			let new_hash = manifest::hash_entry(&new_enc);
+			if manifest::hash_entry(&old_enc) == new_hash {
+				return Ok(()); // same encrypted name -> nothing to do
+			}
+
+			// Collision guard: refuse if the target name already exists here.
+			let existing = s.store.load(&backend, keys, &parent).await?;
+			if existing.name_for(&new_hash).is_some() {
+				return Err(anyhow!("an item named \"{new_name}\" already exists here"));
+			}
+
+			let (from, to) = if is_dir {
+				let from = if key.ends_with('/') {
+					key.to_string()
+				} else {
+					format!("{key}/")
+				};
+				(from, format!("{parent}{new_hash}/"))
+			} else {
+				// Use the authoritative on-disk key as the source rather than
+				// reconstructing it, so the move always targets the real object.
+				(key.to_string(), format!("{parent}{new_hash}"))
+			};
+			backend.rename(&from, &to).await?;
+
+			// A renamed folder's buffered child manifest now lives under a new
+			// prefix; forget the stale buffered copy so it isn't flushed back.
+			if is_dir {
+				s.store.forget(from.trim_end_matches('/')).await;
+			}
+
+			let (oe, ne, nn) = (old_enc, new_enc, new_name.to_string());
+			s.store
+				.edit(&backend, keys, &parent, move |m| {
+					m.rename_entry(&oe, &ne, &nn);
+				})
+				.await?;
+			s.store.flush(&backend, keys, FlushReason::Forced).await?;
+			Ok(())
+		}
+		_ => {
+			// Plaintext rename: no E2EE, or a foreign object in an E2EE session.
+			// The on-disk name is literal, so just move the key; no manifest.
+			let new_segment = new_name.to_string();
+			if is_dir {
+				let from = if key.ends_with('/') {
+					key.to_string()
+				} else {
+					format!("{key}/")
+				};
+				let to = format!("{parent}{new_segment}/");
+				if to == from {
+					return Ok(());
+				}
+				backend.rename(&from, &to).await?;
+			} else {
+				let to = format!("{parent}{new_segment}");
+				if to == key {
+					return Ok(());
+				}
+				backend.rename(key, &to).await?;
+			}
+			Ok(())
+		}
+	}
+}
+
+/// Recursively total the bytes under a folder. Returns `(plaintext, encrypted)`.
+///
+/// `encrypted` is the sum of on-disk object sizes. `plaintext` is the logical
+/// size: for an E2EE session each encrypted object's plaintext size is derived
+/// from its ciphertext length; without E2EE the two totals are equal.
+async fn run_calculate_size(
+	s: &Session,
+	key: &str,
+	name: &str,
+	encrypted: bool,
+) -> Result<(u64, u64)> {
+	let backend = s.backend().await;
+	let objects = backend.list_recursive(key).await?;
+	let mut enc_total = 0u64;
+	let mut plaintext = 0u64;
+	for o in &objects {
+		// Skip per-directory `.rse` manifests and the vault: they're metadata,
+		// not user data, and would otherwise inflate both totals.
+		let leaf = o.key.trim_end_matches('/').rsplit('/').next().unwrap_or("");
+		if manifest::is_manifest_key(leaf) || leaf == crypto::VAULT_KEY {
+			continue;
+		}
+		enc_total = enc_total.saturating_add(o.size);
+		plaintext = plaintext.saturating_add(match s.keys.as_deref() {
+			// Ciphertext -> plaintext size, inverse of `crypto::encrypted_size`.
+			Some(_) => plaintext_of_ciphertext(o.size),
+			None => o.size,
+		});
+	}
+
+	// Cache the roll-up on this folder's entry, which lives in the *parent*
+	// directory's manifest, so future listings show the size instantly. Only
+	// genuine E2EE folders have a manifest entry to write into.
+	if encrypted {
+		if let Some(keys) = s.keys.as_deref() {
+			let parent = parent_prefix(key);
+			if let Ok(enc) = crypto::encrypt_name(keys, name) {
+				let now_ms = std::time::SystemTime::now()
+					.duration_since(std::time::UNIX_EPOCH)
+					.map(|d| d.as_millis() as i64)
+					.unwrap_or(0);
+				let (enc_c, p, e) = (enc, plaintext, enc_total);
+				let _ = s
+					.store
+					.edit(&backend, keys, &parent, move |m| {
+						m.set_folder_size(&enc_c, p, e, now_ms);
+					})
+					.await;
+				let _ = s.store.flush(&backend, keys, FlushReason::Forced).await;
+			}
+		}
+	}
+
+	Ok((plaintext, enc_total))
+}
+
+/// Walk an encrypted folder, reading each directory's `.rse` manifest and raw
+/// listing, to build a full breakdown for the Info modal: per-file plaintext and
+/// ciphertext sizes with real relative paths, totals, counts, and the folder's
+/// last cached-size timestamp.
+async fn collect_folder_info(s: &Session, key: &str, name: &str) -> Result<FolderInfo> {
+	let backend = s.backend().await;
+	let keys = s
+		.keys
+		.as_deref()
+		.ok_or_else(|| anyhow!("folder info is only available for encrypted folders"))?;
+
+	let root = format!("{}/", key.trim_end_matches('/'));
+	let mut files: Vec<FileInfo> = Vec::new();
+	let mut folder_count = 0u64;
+	let mut plaintext_total = 0u64;
+	let mut encrypted_total = 0u64;
+
+	// (backend dir prefix, human relative path so far)
+	let mut stack: Vec<(String, String)> = vec![(root.clone(), String::new())];
+	while let Some((dir, rel_base)) = stack.pop() {
+		let manifest = s.store.load(&backend, keys, &dir).await.unwrap_or_default();
+		let raw = backend.list(&dir).await?;
+
+		for o in &raw {
+			let leaf = o.key.trim_end_matches('/').rsplit('/').next().unwrap_or("");
+			if manifest::is_manifest_key(leaf) || leaf == crypto::VAULT_KEY {
+				continue;
+			}
+			if o.is_prefix {
+				// A subfolder: recurse. Its real name comes from this manifest.
+				folder_count += 1;
+				let sub_name = manifest.name_for(leaf).unwrap_or(leaf).to_string();
+				let sub_rel = if rel_base.is_empty() {
+					sub_name
+				} else {
+					format!("{rel_base}/{sub_name}")
+				};
+				stack.push((format!("{dir}{leaf}/"), sub_rel));
+			} else {
+				// A file: plaintext size from the manifest, ciphertext from disk.
+				let plaintext = manifest
+					.files
+					.get(leaf)
+					.map(|f| f.size)
+					.unwrap_or_else(|| plaintext_of_ciphertext(o.size));
+				let fname = manifest.name_for(leaf).unwrap_or(leaf).to_string();
+				let rel_path = if rel_base.is_empty() {
+					fname
+				} else {
+					format!("{rel_base}/{fname}")
+				};
+				plaintext_total = plaintext_total.saturating_add(plaintext);
+				encrypted_total = encrypted_total.saturating_add(o.size);
+				files.push(FileInfo {
+					rel_path,
+					plaintext,
+					encrypted: o.size,
+				});
+			}
+		}
+	}
+
+	// The cached-size timestamp lives on this folder's entry in its *parent*
+	// manifest.
+	let parent = parent_prefix(key);
+	let computed = {
+		let parent_manifest = s.store.load(&backend, keys, &parent).await.ok();
+		parent_manifest.and_then(|m| {
+			crypto::encrypt_name(keys, name).ok().and_then(|enc| {
+				m.folders
+					.get(&manifest::hash_entry(&enc))
+					.and_then(|f| f.computed)
+			})
+		})
+	};
+
+	let file_count = files.len() as u64;
+	files.sort_by(|a, b| b.encrypted.cmp(&a.encrypted));
+
+	Ok(FolderInfo {
+		name: name.to_string(),
+		file_count,
+		folder_count,
+		plaintext_total,
+		encrypted_total,
+		computed,
+		files,
+	})
+}
+
+/// Inverse of `crypto::encrypted_size`: recover a file's plaintext length from
+/// its on-disk ciphertext length. Header + one Poly1305 tag per 1 MiB chunk are
+/// overhead; subtract them. Returns 0 if the size is too small to be a valid
+/// encrypted object (e.g. a folder marker), which contributes nothing.
+fn plaintext_of_ciphertext(cipher_len: u64) -> u64 {
+	let header = crypto::HEADER_LEN as u64;
+	let tag = crypto::TAG as u64;
+	let chunk = crypto::CHUNK as u64;
+	let Some(body) = cipher_len.checked_sub(header) else {
+		return 0;
+	};
+	if body < tag {
+		return 0;
+	}
+	// body = plaintext + chunks*tag, where chunks = ceil(plaintext/chunk),
+	// and an empty file still has one (empty) chunk. Compute chunk count from
+	// the ciphertext body, then strip that many tags.
+	let cipher_chunk = chunk + tag; // full encrypted chunk
+	let full_chunks = body / cipher_chunk;
+	let remainder = body % cipher_chunk; // last (possibly partial) chunk incl. its tag
+	let chunks = full_chunks + if remainder > 0 { 1 } else { 0 };
+	body.saturating_sub(chunks.max(1) * tag)
 }

@@ -111,12 +111,29 @@ machine - the app falls back to the edit form so you can re-enter the secret.
   prefix makes nonce reuse across files astronomically unlikely even at very
   large file counts. Works streaming - large files are encrypted and uploaded
   without ever being fully in RAM.
-- **Filenames:** each path segment encrypted with AES-256-SIV (deterministic, so
-  listing/navigation still works) and base32-encoded. Trade-off: identical names
-  produce identical ciphertexts (an observer can correlate, but not read, names),
-  and ciphertext length tracks name length, so relative name sizes are visible.
-- The first E2EE connection initializes a small `.rse-vault` file (random salt + an encrypted canary
-  used to verify your password on later connects). Its
+- **Filenames:** each path segment is encrypted with AES-256-SIV (deterministic)
+  and then stored on the backend under `SHA-256` of that ciphertext, as a 64-char
+  uppercase-hex name. Hashing keeps on-disk names a fixed length - so arbitrarily
+  long names work even though most filesystems cap a segment at 255 chars - while
+  staying deterministic, so the app can compute exactly where a file lives without
+  reading anything. The real name and plaintext size live in the directory's
+  encrypted manifest (below). Trade-off: because the mapping is deterministic, an
+  observer can still see that two objects share a name or folder, but not what the
+  name is, and no longer learns anything from name lengths.
+- **Directory manifests (`.rse`):** each directory holds one `.rse` object - a
+  JSON map from each on-disk hash to its real name and unencrypted size, plus
+  optional cached recursive folder sizes - encrypted as a whole with the content
+  key (so the server sees only ciphertext for metadata too). Listing a directory
+  is therefore a single manifest read, and file sizes shown are the true plaintext
+  sizes. Manifests are buffered in memory and written back on a short interval
+  (default 10 s, in Settings) and at the end of each batch, to keep request counts
+  and costs low; **exactly one instance should manage an encrypted bucket at a
+  time.** If the app is interrupted mid-upload, freshly written objects can briefly
+  outrun their manifest entry; such items are shown as `[unrecovered]` in the
+  listing (never hidden) and are restored by re-uploading, which lands on the same
+  deterministic name.
+- The first E2EE connection initializes a small `.rse-vault` file (random salt +
+  an encrypted canary used to verify your password on later connects). Its
   location is the storage unit's root: the bucket root for S3, the export root
   for NFS, the configured directory for SMB. For SFTP it is anchored to the
   _account_, not the browsed directory: it lives in the SSH user's home
@@ -133,11 +150,12 @@ location works but is best avoided.
 
 ## Defaults (changeable in Settings ⚙)
 
-| Setting             | Default | Why                                                                         |
-| ------------------- | ------- | --------------------------------------------------------------------------- |
-| Parallel uploads    | 12      | Thousands of small files are latency-bound; parallelism wins                |
-| Parallel downloads  | 6       | Balanced against local disk write pressure                                  |
-| Multipart threshold | 64 MiB  | Small objects are cheaper as single PUTs                                    |
-| Part size           | 16 MiB  | Fewer requests per large file; the S3 minimum is 5 MiB                      |
-| Retries             | 500000  | Retries per object before it is reported as failed                          |
-| Reconnect interval  | 3       | Delay between reconnect/retry attempts after the connection drops (seconds) |
+| Setting                 | Default | Why                                                                         |
+| ----------------------- | ------- | --------------------------------------------------------------------------- |
+| Parallel uploads        | 12      | Thousands of small files are latency-bound; parallelism wins                |
+| Parallel downloads      | 6       | Balanced against local disk write pressure                                  |
+| Multipart threshold     | 64 MiB  | Small objects are cheaper as single PUTs                                    |
+| Part size               | 16 MiB  | Fewer requests per large file; the S3 minimum is 5 MiB                      |
+| Retries                 | 500000  | Retries per object before it is reported as failed                          |
+| Reconnect interval      | 3       | Delay between reconnect/retry attempts after the connection drops (seconds) |
+| Manifest flush interval | 10      | How often encrypted directory metadata is saved back (seconds)              |

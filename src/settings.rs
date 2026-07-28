@@ -28,6 +28,9 @@ pub struct Settings {
 	/// drops (seconds). A short value resumes transfers quickly once the
 	/// network returns.
 	pub reconnect_interval_secs: u64,
+	/// How often buffered `.rse` directory manifests are written back, in
+	/// seconds. Lower = fresher metadata but more requests; higher = cheaper.
+	pub manifest_flush_secs: u64,
 }
 
 impl Default for Settings {
@@ -39,6 +42,7 @@ impl Default for Settings {
 			part_size_mib: 16,
 			retries: 500_000,
 			reconnect_interval_secs: 3,
+			manifest_flush_secs: 10,
 		}
 	}
 }

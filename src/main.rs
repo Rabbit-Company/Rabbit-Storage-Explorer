@@ -1,4 +1,7 @@
 mod crypto;
+mod dir_view;
+mod manifest;
+mod manifest_store;
 mod settings;
 mod storage;
 mod ui;

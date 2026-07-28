@@ -116,7 +116,12 @@ impl BrowserPage {
 		})));
 		let size_col = text_column("Size", 100, |e| {
 			if e.is_dir {
-				String::new()
+				// Folders have no size until "Calculate size" caches one. Show it when available, otherwise leave blank.
+				if e.size > 0 {
+					human_size(e.size)
+				} else {
+					String::new()
+				}
 			} else {
 				human_size(e.size)
 			}
@@ -653,9 +658,27 @@ impl BrowserPage {
 
 	fn show_row_menu(&self, entry: RemoteEntry, anchor: &impl IsA<gtk::Widget>, x: f64, y: f64) {
 		let btn_dl = menu_row("folder-download-symbolic", "Download");
+		let btn_rename = menu_row("document-edit-symbolic", "Rename");
 		let btn_del = menu_row("user-trash-symbolic", "Delete");
 		let menu = gtk::Box::new(gtk::Orientation::Vertical, 0);
 		menu.append(&btn_dl);
+		menu.append(&btn_rename);
+		// "Info" gives a full breakdown; only meaningful for encrypted folders (it reads their manifests).
+		let btn_info = if entry.is_dir && entry.encrypted == Some(true) {
+			let b = menu_row("dialog-information-symbolic", "Info");
+			menu.append(&b);
+			Some(b)
+		} else {
+			None
+		};
+		// "Calculate size" only makes sense for folders.
+		let btn_size = if entry.is_dir {
+			let b = menu_row("view-list-symbolic", "Calculate size");
+			menu.append(&b);
+			Some(b)
+		} else {
+			None
+		};
 		menu.append(&btn_del);
 
 		let popover = gtk::Popover::new();
@@ -673,6 +696,48 @@ impl BrowserPage {
 				p.download_items(vec![e.clone()]);
 			}
 		});
+
+		let p = self.weak_self.clone();
+		let e = entry.clone();
+		let pop = popover.clone();
+		btn_rename.connect_clicked(move |_| {
+			pop.popdown();
+			if let Some(p) = p.upgrade() {
+				p.rename_dialog(e.clone());
+			}
+		});
+
+		if let Some(btn_size) = btn_size {
+			let p = self.weak_self.clone();
+			let e = entry.clone();
+			let pop = popover.clone();
+			btn_size.connect_clicked(move |_| {
+				pop.popdown();
+				if let Some(p) = p.upgrade() {
+					let _ = p.cmd.send_blocking(Command::CalculateSize {
+						key: e.key.clone(),
+						name: e.name.clone(),
+						encrypted: e.encrypted == Some(true),
+					});
+				}
+			});
+		}
+
+		if let Some(btn_info) = btn_info {
+			let p = self.weak_self.clone();
+			let e = entry.clone();
+			let pop = popover.clone();
+			btn_info.connect_clicked(move |_| {
+				pop.popdown();
+				if let Some(p) = p.upgrade() {
+					let _ = p.cmd.send_blocking(Command::FolderInfo {
+						key: e.key.clone(),
+						name: e.name.clone(),
+					});
+				}
+			});
+		}
+
 		let p = self.weak_self.clone();
 		let pop = popover.clone();
 		btn_del.connect_clicked(move |_| {
@@ -683,6 +748,59 @@ impl BrowserPage {
 		});
 
 		popover.popup();
+	}
+
+	/// Prompt for a new name and send a `Rename` command.
+	fn rename_dialog(&self, entry: RemoteEntry) {
+		let Some(window) = self.window.upgrade() else {
+			return;
+		};
+		let Some(p) = self.weak_self.upgrade() else {
+			return;
+		};
+
+		let row = adw::EntryRow::builder().title("New name").build();
+		row.set_text(&entry.name);
+		let list = gtk::ListBox::new();
+		list.add_css_class("boxed-list");
+		list.append(&row);
+
+		let dialog = adw::AlertDialog::new(Some("Rename"), None);
+		dialog.set_extra_child(Some(&list));
+		dialog.add_response("cancel", "Cancel");
+		dialog.add_response("rename", "Rename");
+		dialog.set_response_appearance("rename", adw::ResponseAppearance::Suggested);
+		dialog.set_default_response(Some("rename"));
+		dialog.set_close_response("cancel");
+
+		let old_name = entry.name.clone();
+		let valid = move |name: &str| {
+			!name.is_empty() && !name.contains('/') && name != "." && name != ".." && name != old_name
+		};
+		dialog.set_response_enabled("rename", false);
+		let d = dialog.clone();
+		let valid_c = valid.clone();
+		row.connect_changed(move |e| {
+			d.set_response_enabled("rename", valid_c(e.text().trim()));
+		});
+
+		let r = row.clone();
+		dialog.connect_response(Some("rename"), move |_, _| {
+			let new_name = r.text().trim().to_string();
+			if valid(&new_name) {
+				let _ = p.cmd.send_blocking(Command::Rename {
+					key: entry.key.clone(),
+					is_dir: entry.is_dir,
+					old_name: entry.name.clone(),
+					new_name,
+					// Only a genuine E2EE item (Some(true)) is hash-named and
+					// manifest-backed; foreign (Some(false)) and non-E2EE (None)
+					// entries are renamed in place as plaintext.
+					encrypted: entry.encrypted == Some(true),
+				});
+			}
+		});
+		dialog.present(Some(&window));
 	}
 
 	fn entry_by_key(&self, key: &str) -> Option<RemoteEntry> {
