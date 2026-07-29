@@ -1347,6 +1347,13 @@ async fn run_download(
 				Ok(objs) => {
 					let parent = parent_prefix(&item.key);
 					for o in objs {
+						if o.key.ends_with('/') {
+							continue;
+						}
+						let leaf = o.key.rsplit('/').find(|s| !s.is_empty()).unwrap_or("");
+						if manifest::is_manifest_key(leaf) {
+							continue;
+						}
 						let rel_raw = o.key.strip_prefix(&parent).unwrap_or(&o.key).to_string();
 						let rel = display_rel(&s, &rel_raw);
 						targets.push((o.key, rel, o.size));
