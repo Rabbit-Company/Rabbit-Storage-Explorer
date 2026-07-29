@@ -566,20 +566,44 @@ impl ConnectionPage {
 		dialog.set_extra_child(Some(&list));
 		dialog.add_response("cancel", "Cancel");
 		dialog.add_response("connect", "Connect");
+
 		dialog.set_response_appearance("connect", adw::ResponseAppearance::Suggested);
 		dialog.set_default_response(Some("connect"));
 
 		let weak = self.weak_self.clone();
-		dialog.connect_response(Some("connect"), move |_, _| {
-			let password = entry.text().to_string();
-			if password.is_empty() {
-				return;
-			}
-			if let Some(p) = weak.upgrade() {
-				p.send_connect(profile.clone(), secret.clone(), Some(password));
-			}
-		});
+		{
+			let entry = entry.clone();
+			let profile = profile.clone();
+			let secret = secret.clone();
+			dialog.connect_response(Some("connect"), move |_, _| {
+				let password = entry.text().to_string();
+				if password.is_empty() {
+					return;
+				}
+				if let Some(p) = weak.upgrade() {
+					p.send_connect(profile.clone(), secret.clone(), Some(password));
+				}
+			});
+		}
+
+		{
+			let weak = self.weak_self.clone();
+			let entry_c = entry.clone();
+			let dialog_c = dialog.clone();
+			entry.connect_entry_activated(move |_| {
+				let password = entry_c.text().to_string();
+				if password.is_empty() {
+					return;
+				}
+				if let Some(p) = weak.upgrade() {
+					p.send_connect(profile.clone(), secret.clone(), Some(password));
+				}
+				dialog_c.close();
+			});
+		}
+
 		dialog.present(Some(&window));
+		entry.grab_focus();
 	}
 
 	/// Connect using the form contents (add / edit path).

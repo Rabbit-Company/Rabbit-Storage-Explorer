@@ -576,23 +576,46 @@ impl BrowserPage {
 
 		// Live-validate: Create stays disabled until the name is usable.
 		let valid = |name: &str| !name.is_empty() && !name.contains('/') && name != "." && name != "..";
+
 		dialog.set_response_enabled("create", false);
 		let d = dialog.clone();
 		entry.connect_changed(move |e| {
 			d.set_response_enabled("create", valid(e.text().trim()));
 		});
 
-		let e = entry.clone();
-		dialog.connect_response(Some("create"), move |_, _| {
-			let name = e.text().trim().to_string();
-			if valid(&name) {
-				let _ = p.cmd.send_blocking(Command::CreateFolder {
-					prefix: p.current_prefix(),
-					name,
-				});
-			}
-		});
+		{
+			let p = p.clone();
+			let entry = entry.clone();
+			dialog.connect_response(Some("create"), move |_, _| {
+				let name = entry.text().trim().to_string();
+				if valid(&name) {
+					let _ = p.cmd.send_blocking(Command::CreateFolder {
+						prefix: p.current_prefix(),
+						name,
+					});
+				}
+			});
+		}
+
+		// Enter confirms (only when valid) and closes.
+		{
+			let p = p.clone();
+			let entry_c = entry.clone();
+			let dialog_c = dialog.clone();
+			entry.connect_entry_activated(move |_| {
+				let name = entry_c.text().trim().to_string();
+				if valid(&name) {
+					let _ = p.cmd.send_blocking(Command::CreateFolder {
+						prefix: p.current_prefix(),
+						name,
+					});
+					dialog_c.close();
+				}
+			});
+		}
+
 		dialog.present(Some(&window));
+		entry.grab_focus();
 	}
 
 	fn download_selected(&self) {
@@ -777,6 +800,7 @@ impl BrowserPage {
 		let valid = move |name: &str| {
 			!name.is_empty() && !name.contains('/') && name != "." && name != ".." && name != old_name
 		};
+
 		dialog.set_response_enabled("rename", false);
 		let d = dialog.clone();
 		let valid_c = valid.clone();
@@ -784,23 +808,47 @@ impl BrowserPage {
 			d.set_response_enabled("rename", valid_c(e.text().trim()));
 		});
 
-		let r = row.clone();
-		dialog.connect_response(Some("rename"), move |_, _| {
-			let new_name = r.text().trim().to_string();
-			if valid(&new_name) {
-				let _ = p.cmd.send_blocking(Command::Rename {
-					key: entry.key.clone(),
-					is_dir: entry.is_dir,
-					old_name: entry.name.clone(),
-					new_name,
-					// Only a genuine E2EE item (Some(true)) is hash-named and
-					// manifest-backed; foreign (Some(false)) and non-E2EE (None)
-					// entries are renamed in place as plaintext.
-					encrypted: entry.encrypted == Some(true),
-				});
-			}
-		});
+		{
+			let p = p.clone();
+			let row = row.clone();
+			let entry = entry.clone();
+			let valid = valid.clone();
+			dialog.connect_response(Some("rename"), move |_, _| {
+				let new_name = row.text().trim().to_string();
+				if valid(&new_name) {
+					let _ = p.cmd.send_blocking(Command::Rename {
+						key: entry.key.clone(),
+						is_dir: entry.is_dir,
+						old_name: entry.name.clone(),
+						new_name,
+						encrypted: entry.encrypted == Some(true),
+					});
+				}
+			});
+		}
+
+		// Enter confirms (only when valid) and closes.
+		{
+			let p = p.clone();
+			let row_c = row.clone();
+			let dialog_c = dialog.clone();
+			row.connect_entry_activated(move |_| {
+				let new_name = row_c.text().trim().to_string();
+				if valid(&new_name) {
+					let _ = p.cmd.send_blocking(Command::Rename {
+						key: entry.key.clone(),
+						is_dir: entry.is_dir,
+						old_name: entry.name.clone(),
+						new_name,
+						encrypted: entry.encrypted == Some(true),
+					});
+					dialog_c.close();
+				}
+			});
+		}
+
 		dialog.present(Some(&window));
+		row.grab_focus();
 	}
 
 	fn entry_by_key(&self, key: &str) -> Option<RemoteEntry> {
