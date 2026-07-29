@@ -8,6 +8,7 @@ use crate::crypto::{self, VaultKeys};
 use crate::dir_view;
 use crate::manifest;
 use crate::manifest_store::{FlushReason, ManifestStore};
+use crate::ratelimit::RateLimiter;
 use crate::settings::{BackendKind, ConnectionProfile, Settings};
 use crate::storage::ProgressSink;
 use crate::storage::{
@@ -209,6 +210,9 @@ struct Conn {
 	generation: AtomicU64,
 	/// Fixed reconnect/retry delay in milliseconds; updated live on SetSettings.
 	reconnect_interval_ms: AtomicU64,
+	/// Global download rate limiter, shared by every download task in this
+	/// session; updated live on SetSettings. 0 bytes/sec = unlimited.
+	download_limiter: Arc<RateLimiter>,
 	ev: async_channel::Sender<Event>,
 }
 
@@ -333,6 +337,10 @@ async fn dispatch(cmd_rx: async_channel::Receiver<Command>, ev: async_channel::S
 					sess
 						.store
 						.set_interval(std::time::Duration::from_secs(s.manifest_flush_secs.max(1)));
+					sess
+						.conn
+						.download_limiter
+						.set_rate(mbps_to_bps(s.max_download_mbps));
 				}
 				settings = s;
 			}
@@ -357,6 +365,7 @@ async fn dispatch(cmd_rx: async_channel::Receiver<Command>, ev: async_channel::S
 				&secret_key,
 				password.as_deref(),
 				settings.reconnect_interval_secs.max(1) * 1000,
+				mbps_to_bps(settings.max_download_mbps),
 				ev.clone(),
 			)
 			.await
@@ -562,11 +571,18 @@ async fn dispatch(cmd_rx: async_channel::Receiver<Command>, ev: async_channel::S
 	}
 }
 
+/// Megabits/second -> bytes/second
+/// 1 Mbps = 1_000_000 bits/s = 125_000 bytes/s.
+fn mbps_to_bps(mbps: u64) -> u64 {
+	mbps.saturating_mul(125_000)
+}
+
 async fn connect(
 	profile: &ConnectionProfile,
 	secret: &str,
 	password: Option<&str>,
 	reconnect_interval_ms: u64,
+	download_limit_bps: u64,
 	ev: async_channel::Sender<Event>,
 ) -> Result<Session> {
 	let backend = connect_backend(profile, secret).await?;
@@ -612,6 +628,7 @@ async fn connect(
 			reconnect: tokio::sync::Mutex::new(()),
 			generation: AtomicU64::new(0),
 			reconnect_interval_ms: AtomicU64::new(reconnect_interval_ms),
+			download_limiter: Arc::new(RateLimiter::new(download_limit_bps)),
 			ev,
 		}),
 	})
@@ -1580,6 +1597,11 @@ async fn download_one(
 					if n == 0 {
 						break;
 					}
+					tokio::select! {
+						biased;
+						_ = cancel.cancelled() => return Err(anyhow!("cancelled")),
+						_ = s.conn.download_limiter.acquire(n as u64) => {}
+					}
 					file.write_all(&buf[..n]).await?;
 					progress.tick(id, n as u64);
 				}
@@ -1621,6 +1643,11 @@ async fn download_one(
 						r = read_or_stall(reader.read_exact(&mut buf[..clen])) => {
 							r.context("reading chunk")?;
 						}
+					}
+					tokio::select! {
+						biased;
+						_ = cancel.cancelled() => return Err(anyhow!("cancelled")),
+						_ = s.conn.download_limiter.acquire(clen as u64) => {}
 					}
 					let plain = dec.open_chunk(&buf[..clen], last)?;
 					file.write_all(&plain).await?;

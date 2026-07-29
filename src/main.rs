@@ -2,6 +2,7 @@ mod crypto;
 mod dir_view;
 mod manifest;
 mod manifest_store;
+mod ratelimit;
 mod settings;
 mod storage;
 mod ui;
