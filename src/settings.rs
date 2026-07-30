@@ -21,6 +21,9 @@ pub struct Settings {
 	/// Maximum download speed in megabits/second (Mbps). 0 = unlimited. A global
 	/// ceiling shared across all concurrent downloads, not a per-file limit.
 	pub max_download_mbps: u64,
+	/// Maximum upload speed in megabits/second (Mbps). 0 = unlimited. A global
+	/// ceiling shared across all concurrent uploads, not a per-file limit.
+	pub max_upload_mbps: u64,
 	/// Files larger than this (MiB) use multipart upload.
 	pub multipart_threshold_mib: u64,
 	/// Multipart part size (MiB). The S3 minimum is 5 MiB.
@@ -42,6 +45,7 @@ impl Default for Settings {
 			upload_parallelism: 12,
 			download_parallelism: 6,
 			max_download_mbps: 0,
+			max_upload_mbps: 0,
 			multipart_threshold_mib: 64,
 			part_size_mib: 16,
 			retries: 500_000,

@@ -3,6 +3,7 @@
 use crate::storage::ProgressSink;
 
 use super::{MultipartUpload, RawObject, Reader, StorageBackend};
+use crate::ratelimit::RateLimiter;
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use aws_config::timeout::TimeoutConfig;
@@ -10,11 +11,85 @@ use aws_config::BehaviorVersion;
 use aws_sdk_s3::config::{Credentials, Region};
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart, Delete, ObjectIdentifier};
 use aws_sdk_s3::Client;
+use aws_smithy_types::body::SdkBody;
 use aws_smithy_types::byte_stream::ByteStream;
+use bytes::Bytes;
+use http_body::{Body, Frame, SizeHint};
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::Poll;
 
 pub struct S3Backend {
 	client: Client,
 	bucket: String,
+}
+
+struct PacedBody {
+	rx: tokio::sync::mpsc::Receiver<Bytes>,
+	remaining: u64,
+}
+
+impl PacedBody {
+	fn new(data: Bytes, limiter: Arc<RateLimiter>) -> Self {
+		let total = data.len() as u64;
+		let (tx, rx) = tokio::sync::mpsc::channel(4);
+		tokio::spawn(async move {
+			const CHUNK: usize = 64 * 1024;
+			let mut off = 0usize;
+			while off < data.len() {
+				let end = (off + CHUNK).min(data.len());
+				limiter.acquire((end - off) as u64).await;
+				if tx.send(data.slice(off..end)).await.is_err() {
+					break; // body dropped (upload cancelled/aborted)
+				}
+				off = end;
+			}
+		});
+		Self {
+			rx,
+			remaining: total,
+		}
+	}
+}
+
+impl Body for PacedBody {
+	type Data = Bytes;
+	type Error = std::convert::Infallible;
+
+	fn poll_frame(
+		self: Pin<&mut Self>,
+		cx: &mut std::task::Context<'_>,
+	) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
+		let this = self.get_mut();
+		match this.rx.poll_recv(cx) {
+			Poll::Ready(Some(chunk)) => {
+				this.remaining = this.remaining.saturating_sub(chunk.len() as u64);
+				Poll::Ready(Some(Ok(Frame::data(chunk))))
+			}
+			Poll::Ready(None) => Poll::Ready(None),
+			Poll::Pending => Poll::Pending,
+		}
+	}
+
+	fn is_end_stream(&self) -> bool {
+		self.remaining == 0
+	}
+
+	fn size_hint(&self) -> SizeHint {
+		SizeHint::with_exact(self.remaining)
+	}
+}
+
+fn throttled_bytestream(data: Vec<u8>, limiter: Option<Arc<RateLimiter>>) -> ByteStream {
+	match limiter {
+		Some(l) if !l.is_unlimited() => {
+			let data = Bytes::from(data);
+			ByteStream::new(SdkBody::retryable(move || {
+				SdkBody::from_body_1_x(PacedBody::new(data.clone(), l.clone()))
+			}))
+		}
+		_ => ByteStream::from(data),
+	}
 }
 
 /// AWS requires the CopyObject source (`bucket/key`) to be URL-encoded.
@@ -218,6 +293,24 @@ impl StorageBackend for S3Backend {
 		Ok(())
 	}
 
+	async fn put_throttled(
+		&self,
+		key: &str,
+		data: Vec<u8>,
+		limiter: Option<Arc<RateLimiter>>,
+	) -> Result<()> {
+		self
+			.client
+			.put_object()
+			.bucket(&self.bucket)
+			.key(key)
+			.body(throttled_bytestream(data, limiter))
+			.send()
+			.await
+			.with_context(|| format!("upload failed: {key}"))?;
+		Ok(())
+	}
+
 	async fn create_multipart(&self, key: &str) -> Result<MultipartUpload> {
 		let out = self
 			.client
@@ -242,6 +335,7 @@ impl StorageBackend for S3Backend {
 		part_number: i32,
 		data: Vec<u8>,
 		on_bytes: Option<ProgressSink>,
+		limiter: Option<Arc<RateLimiter>>,
 	) -> Result<String> {
 		let len = data.len() as u64;
 		let out = self
@@ -251,7 +345,7 @@ impl StorageBackend for S3Backend {
 			.key(&mp.key)
 			.upload_id(&mp.upload_id)
 			.part_number(part_number)
-			.body(ByteStream::from(data))
+			.body(throttled_bytestream(data, limiter))
 			.send()
 			.await
 			.with_context(|| format!("uploading part {part_number}"))?;

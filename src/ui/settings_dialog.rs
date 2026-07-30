@@ -32,6 +32,13 @@ pub fn present(
 		10_000.0,
 		current.max_download_mbps as f64,
 	);
+	let ul_limit = spin_row(
+		"Max upload speed (Mbps)",
+		"Shared across all uploads. 0 = unlimited",
+		0.0,
+		10_000.0,
+		current.max_upload_mbps as f64,
+	);
 	let retries = spin_row(
 		"Retries per file",
 		"Failed transfers are retried at the reconnect interval below",
@@ -56,6 +63,7 @@ pub fn present(
 	transfers.add(&up);
 	transfers.add(&down);
 	transfers.add(&dl_limit);
+	transfers.add(&ul_limit);
 	transfers.add(&retries);
 	transfers.add(&reconnect);
 	transfers.add(&flush);
@@ -93,6 +101,7 @@ pub fn present(
 			upload_parallelism: up.value() as usize,
 			download_parallelism: down.value() as usize,
 			max_download_mbps: dl_limit.value() as u64,
+			max_upload_mbps: ul_limit.value() as u64,
 			retries: retries.value() as u32,
 			multipart_threshold_mib: threshold.value() as u64,
 			part_size_mib: part.value() as u64,

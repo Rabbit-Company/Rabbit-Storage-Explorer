@@ -3,6 +3,7 @@
 //! and no root privileges required.
 
 use super::{ChannelReader, MultipartUpload, RawObject, Reader, StorageBackend};
+use crate::ratelimit::RateLimiter;
 use crate::settings::ConnectionProfile;
 use crate::storage::ProgressSink;
 use anyhow::{anyhow, bail, Context, Result};
@@ -20,6 +21,7 @@ use nfs3_client::tokio::{TokioConnector, TokioIo};
 use nfs3_client::{Nfs3Connection, Nfs3ConnectionBuilder};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 
@@ -208,8 +210,12 @@ impl NfsBackend {
 		mut offset: u64,
 		data: &[u8],
 		on_bytes: Option<&ProgressSink>,
+		limiter: Option<&Arc<RateLimiter>>,
 	) -> Result<u64> {
 		for chunk in data.chunks(WRITE_CHUNK) {
+			if let Some(l) = limiter {
+				l.acquire(chunk.len() as u64).await;
+			}
 			let mut written = 0usize;
 			while written < chunk.len() {
 				let part = &chunk[written..];
@@ -470,8 +476,20 @@ impl StorageBackend for NfsBackend {
 
 	async fn put(&self, key: &str, data: Vec<u8>) -> Result<()> {
 		let fh = self.create_truncated(key).await?;
-		self.write_at(&fh, 0, &data, None).await?;
+		self.write_at(&fh, 0, &data, None, None).await?;
 		self.commit(&fh).await
+	}
+
+	async fn put_throttled(
+		&self,
+		key: &str,
+		data: Vec<u8>,
+		limiter: Option<Arc<RateLimiter>>,
+	) -> Result<()> {
+		let fh = self.create_truncated(key).await?;
+		self.write_at(&fh, 0, &data, None, limiter.as_ref()).await?;
+		self.commit(&fh).await?;
+		Ok(())
 	}
 
 	async fn prepare_parents(&self, key: &str) -> Result<()> {
@@ -545,6 +563,7 @@ impl StorageBackend for NfsBackend {
 		_part_number: i32,
 		data: Vec<u8>,
 		on_bytes: Option<ProgressSink>,
+		limiter: Option<Arc<RateLimiter>>,
 	) -> Result<String> {
 		let (fh, offset, key) = self
 			.uploads
@@ -552,7 +571,9 @@ impl StorageBackend for NfsBackend {
 			.await
 			.remove(&mp.upload_id)
 			.ok_or_else(|| anyhow!("unknown upload id"))?;
-		let result = self.write_at(&fh, offset, &data, on_bytes.as_ref()).await;
+		let result = self
+			.write_at(&fh, offset, &data, on_bytes.as_ref(), limiter.as_ref())
+			.await;
 		match result {
 			Ok(new_offset) => {
 				self

@@ -113,6 +113,20 @@ pub trait StorageBackend: Send + Sync {
 	/// Upload a whole (small) object.
 	async fn put(&self, key: &str, data: Vec<u8>) -> Result<()>;
 
+	/// Upload a whole (small) object, pacing the write through `limiter` when
+	/// one is supplied. Default: ignore the limiter and defer to [`put`].
+	/// Backends that stream their writes override this to throttle at wire
+	/// granularity. `put` itself stays unthrottled - it also serves vault,
+	/// manifest and copy-rename traffic, which should never be capped.
+	async fn put_throttled(
+		&self,
+		key: &str,
+		data: Vec<u8>,
+		_limiter: Option<std::sync::Arc<crate::ratelimit::RateLimiter>>,
+	) -> Result<()> {
+		self.put(key, data).await
+	}
+
 	/// Fetch the E2EE vault metadata for this connection.
 	///
 	/// Default: the `.rse-vault` object at the session root. That is correct
@@ -143,6 +157,7 @@ pub trait StorageBackend: Send + Sync {
 		part_number: i32,
 		data: Vec<u8>,
 		on_bytes: Option<ProgressSink>,
+		limiter: Option<std::sync::Arc<crate::ratelimit::RateLimiter>>,
 	) -> Result<String>;
 
 	async fn complete_multipart(&self, mp: &MultipartUpload, etags: Vec<(i32, String)>)

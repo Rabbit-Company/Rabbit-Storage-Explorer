@@ -12,6 +12,7 @@
 
 use super::{MultipartUpload, RawObject, Reader, StorageBackend};
 use crate::crypto;
+use crate::ratelimit::RateLimiter;
 use crate::settings::{self, ConnectionProfile};
 use crate::storage::ProgressSink;
 use anyhow::{anyhow, bail, Context, Result};
@@ -380,6 +381,33 @@ impl StorageBackend for SftpBackend {
 		.await
 	}
 
+	async fn put_throttled(
+		&self,
+		key: &str,
+		data: Vec<u8>,
+		limiter: Option<Arc<RateLimiter>>,
+	) -> Result<()> {
+		with_timeout(600, async {
+			let mut file = self
+				.sftp
+				.open_with_flags(
+					self.full(key),
+					OpenFlags::CREATE | OpenFlags::TRUNCATE | OpenFlags::WRITE,
+				)
+				.await
+				.with_context(|| format!("upload failed: {key}"))?;
+			for chunk in data.chunks(SFTP_WRITE_CHUNK) {
+				if let Some(l) = &limiter {
+					l.acquire(chunk.len() as u64).await;
+				}
+				file.write_all(chunk).await?;
+			}
+			file.shutdown().await?; // closes the remote handle
+			Ok(())
+		})
+		.await
+	}
+
 	async fn prepare_parents(&self, key: &str) -> Result<()> {
 		with_timeout(120, async {
 			let segments: Vec<&str> = key.trim_end_matches('/').split('/').collect();
@@ -443,6 +471,7 @@ impl StorageBackend for SftpBackend {
 		_part_number: i32,
 		data: Vec<u8>,
 		on_bytes: Option<ProgressSink>,
+		limiter: Option<Arc<RateLimiter>>,
 	) -> Result<String> {
 		let mut file = self
 			.uploads
@@ -452,6 +481,9 @@ impl StorageBackend for SftpBackend {
 			.ok_or_else(|| anyhow!("unknown upload id"))?;
 		let result = with_timeout(600, async {
 			for chunk in data.chunks(SFTP_WRITE_CHUNK) {
+				if let Some(l) = &limiter {
+					l.acquire(chunk.len() as u64).await;
+				}
 				file.write_all(chunk).await?;
 				if let Some(cb) = &on_bytes {
 					cb(chunk.len() as u64);

@@ -48,6 +48,12 @@ impl RateLimiter {
 		}
 	}
 
+	/// True when throttling is disabled (rate 0). Lets callers pick a cheaper
+	/// unthrottled path instead of paying for pacing machinery.
+	pub fn is_unlimited(&self) -> bool {
+		self.rate.load(Ordering::Relaxed) == 0
+	}
+
 	/// Change the rate live. `bytes_per_sec == 0` disables throttling. Every
 	/// clone sharing this `Arc` sees the change on its next `acquire`.
 	pub fn set_rate(&self, bytes_per_sec: u64) {

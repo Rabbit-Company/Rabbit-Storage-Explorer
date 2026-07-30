@@ -5,6 +5,7 @@
 //! concurrently across parallel tasks without holding that lock.
 
 use super::{ChannelReader, MultipartUpload, RawObject, Reader, StorageBackend};
+use crate::ratelimit::RateLimiter;
 use crate::settings::ConnectionProfile;
 use crate::storage::ProgressSink;
 use anyhow::{anyhow, bail, Context, Result};
@@ -13,6 +14,7 @@ use smb2::pack::FileTime;
 use smb2::{ClientConfig, ErrorKind, FileWriter, SmbClient, Tree};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
 
@@ -240,6 +242,33 @@ impl StorageBackend for SmbBackend {
 		Ok(())
 	}
 
+	async fn put_throttled(
+		&self,
+		key: &str,
+		data: Vec<u8>,
+		limiter: Option<Arc<RateLimiter>>,
+	) -> Result<()> {
+		let path = self.full(key);
+		let mut writer = {
+			let (client, tree) = &mut *self.inner.lock().await;
+			client
+				.create_file_writer(tree, &path)
+				.await
+				.with_context(|| format!("upload failed: {key}"))?
+		};
+		for chunk in data.chunks(WRITE_CHUNK) {
+			if let Some(l) = &limiter {
+				l.acquire(chunk.len() as u64).await;
+			}
+			writer
+				.write_chunk(chunk)
+				.await
+				.context("SMB write failed")?;
+		}
+		writer.finish().await.context("SMB close failed")?;
+		Ok(())
+	}
+
 	async fn prepare_parents(&self, key: &str) -> Result<()> {
 		let segments: Vec<&str> = key.trim_end_matches('/').split('/').collect();
 		if segments.len() <= 1 {
@@ -300,6 +329,7 @@ impl StorageBackend for SmbBackend {
 		_part_number: i32,
 		data: Vec<u8>,
 		on_bytes: Option<ProgressSink>,
+		limiter: Option<Arc<RateLimiter>>,
 	) -> Result<String> {
 		let mut writer = self
 			.uploads
@@ -309,6 +339,9 @@ impl StorageBackend for SmbBackend {
 			.ok_or_else(|| anyhow!("unknown upload id"))?;
 		let mut result = Ok(());
 		for chunk in data.chunks(WRITE_CHUNK) {
+			if let Some(l) = &limiter {
+				l.acquire(chunk.len() as u64).await;
+			}
 			if let Err(e) = writer.write_chunk(chunk).await {
 				result = Err(anyhow!("SMB write failed: {e}"));
 				break;

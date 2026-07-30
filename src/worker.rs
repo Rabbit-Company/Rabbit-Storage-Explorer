@@ -213,6 +213,9 @@ struct Conn {
 	/// Global download rate limiter, shared by every download task in this
 	/// session; updated live on SetSettings. 0 bytes/sec = unlimited.
 	download_limiter: Arc<RateLimiter>,
+	/// Global upload rate limiter, shared by every upload task in this session;
+	/// updated live on SetSettings. 0 bytes/sec = unlimited.
+	upload_limiter: Arc<RateLimiter>,
 	ev: async_channel::Sender<Event>,
 }
 
@@ -341,6 +344,10 @@ async fn dispatch(cmd_rx: async_channel::Receiver<Command>, ev: async_channel::S
 						.conn
 						.download_limiter
 						.set_rate(mbps_to_bps(s.max_download_mbps));
+					sess
+						.conn
+						.upload_limiter
+						.set_rate(mbps_to_bps(s.max_upload_mbps));
 				}
 				settings = s;
 			}
@@ -366,6 +373,7 @@ async fn dispatch(cmd_rx: async_channel::Receiver<Command>, ev: async_channel::S
 				password.as_deref(),
 				settings.reconnect_interval_secs.max(1) * 1000,
 				mbps_to_bps(settings.max_download_mbps),
+				mbps_to_bps(settings.max_upload_mbps),
 				ev.clone(),
 			)
 			.await
@@ -583,6 +591,7 @@ async fn connect(
 	password: Option<&str>,
 	reconnect_interval_ms: u64,
 	download_limit_bps: u64,
+	upload_limit_bps: u64,
 	ev: async_channel::Sender<Event>,
 ) -> Result<Session> {
 	let backend = connect_backend(profile, secret).await?;
@@ -629,6 +638,7 @@ async fn connect(
 			generation: AtomicU64::new(0),
 			reconnect_interval_ms: AtomicU64::new(reconnect_interval_ms),
 			download_limiter: Arc::new(RateLimiter::new(download_limit_bps)),
+			upload_limiter: Arc::new(RateLimiter::new(upload_limit_bps)),
 			ev,
 		}),
 	})
@@ -1248,7 +1258,9 @@ async fn upload_small(
 		Some(k) => crypto::encrypt_bytes(k, &data)?,
 		None => data,
 	};
-	backend.put(key, body).await?;
+	backend
+		.put_throttled(key, body, Some(s.conn.upload_limiter.clone()))
+		.await?;
 	progress.tick(id, plain_len);
 	Ok(())
 }
@@ -1321,7 +1333,13 @@ async fn upload_multipart(
 					));
 				}
 				let etag = backend
-					.upload_part(&mp, part_number, data, Some(sink.clone()))
+					.upload_part(
+						&mp,
+						part_number,
+						data,
+						Some(sink.clone()),
+						Some(s.conn.upload_limiter.clone()),
+					)
 					.await?;
 				etags.push((part_number, etag));
 				part_number += 1;
