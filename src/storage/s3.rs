@@ -16,6 +16,7 @@ use aws_smithy_types::byte_stream::ByteStream;
 use bytes::Bytes;
 use http_body::{Body, Frame, SizeHint};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::task::Poll;
 
@@ -30,7 +31,12 @@ struct PacedBody {
 }
 
 impl PacedBody {
-	fn new(data: Bytes, limiter: Arc<RateLimiter>) -> Self {
+	fn new(
+		data: Bytes,
+		limiter: Arc<RateLimiter>,
+		sink: Option<ProgressSink>,
+		reported: Arc<AtomicU64>,
+	) -> Self {
 		let total = data.len() as u64;
 		let (tx, rx) = tokio::sync::mpsc::channel(4);
 		tokio::spawn(async move {
@@ -43,6 +49,14 @@ impl PacedBody {
 					break; // body dropped (upload cancelled/aborted)
 				}
 				off = end;
+				// Report only progress past the high-water mark, so an SDK-internal
+				// retry that rebuilds this body from the start doesn't double-count.
+				if let Some(cb) = &sink {
+					let prev = reported.fetch_max(off as u64, Ordering::Relaxed);
+					if off as u64 > prev {
+						cb(off as u64 - prev);
+					}
+				}
 			}
 		});
 		Self {
@@ -80,12 +94,22 @@ impl Body for PacedBody {
 	}
 }
 
-fn throttled_bytestream(data: Vec<u8>, limiter: Option<Arc<RateLimiter>>) -> ByteStream {
+fn throttled_bytestream(
+	data: Vec<u8>,
+	limiter: Option<Arc<RateLimiter>>,
+	sink: Option<ProgressSink>,
+) -> ByteStream {
 	match limiter {
 		Some(l) if !l.is_unlimited() => {
 			let data = Bytes::from(data);
+			let reported = Arc::new(AtomicU64::new(0)); // high-water across retries
 			ByteStream::new(SdkBody::retryable(move || {
-				SdkBody::from_body_1_x(PacedBody::new(data.clone(), l.clone()))
+				SdkBody::from_body_1_x(PacedBody::new(
+					data.clone(),
+					l.clone(),
+					sink.clone(),
+					reported.clone(),
+				))
 			}))
 		}
 		_ => ByteStream::from(data),
@@ -304,7 +328,7 @@ impl StorageBackend for S3Backend {
 			.put_object()
 			.bucket(&self.bucket)
 			.key(key)
-			.body(throttled_bytestream(data, limiter))
+			.body(throttled_bytestream(data, limiter, None))
 			.send()
 			.await
 			.with_context(|| format!("upload failed: {key}"))?;
@@ -338,6 +362,9 @@ impl StorageBackend for S3Backend {
 		limiter: Option<Arc<RateLimiter>>,
 	) -> Result<String> {
 		let len = data.len() as u64;
+		// When throttled, the paced body reports progress chunk-by-chunk itself;
+		// otherwise we report the whole part once after it lands.
+		let throttled = limiter.as_ref().is_some_and(|l| !l.is_unlimited());
 		let out = self
 			.client
 			.upload_part()
@@ -345,13 +372,15 @@ impl StorageBackend for S3Backend {
 			.key(&mp.key)
 			.upload_id(&mp.upload_id)
 			.part_number(part_number)
-			.body(throttled_bytestream(data, limiter))
+			.body(throttled_bytestream(data, limiter, on_bytes.clone()))
 			.send()
 			.await
 			.with_context(|| format!("uploading part {part_number}"))?;
 
-		if let Some(cb) = on_bytes {
-			cb(len);
+		if !throttled {
+			if let Some(cb) = on_bytes {
+				cb(len);
+			}
 		}
 		Ok(out.e_tag().unwrap_or_default().to_string())
 	}
