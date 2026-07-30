@@ -259,10 +259,6 @@ pub fn encrypt_path(keys: &VaultKeys, path: &str) -> Result<String> {
 	map_segments(path, |s| encrypt_name(keys, s))
 }
 
-pub fn decrypt_path(keys: &VaultKeys, path: &str) -> Result<String> {
-	map_segments(path, |s| decrypt_name(keys, s))
-}
-
 fn map_segments(path: &str, f: impl Fn(&str) -> Result<String>) -> Result<String> {
 	let mut out = Vec::new();
 	for seg in path.split('/') {

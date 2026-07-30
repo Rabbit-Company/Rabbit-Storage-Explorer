@@ -1020,6 +1020,59 @@ fn expand_paths(paths: &[PathBuf]) -> Vec<(PathBuf, String, u64)> {
 	out
 }
 
+/// Expand a folder into download targets: (backend key /*hashed*/, real
+/// relative path, plaintext size). Walks each directory's `.rse` manifest so
+/// names and sizes come out decrypted. Without E2EE this degrades to raw
+/// names and raw sizes.
+async fn expand_folder(s: &Session, item: &RemoteEntry) -> Result<Vec<(String, String, u64)>> {
+	let backend = s.backend().await;
+	let mut out = Vec::new();
+
+	// Plaintext session: on-disk names are literal, sizes are plaintext.
+	let Some(keys) = s.keys.as_deref() else {
+		let parent = parent_prefix(&item.key);
+		for o in backend.list_recursive(&item.key).await? {
+			if o.key.ends_with('/') {
+				continue;
+			}
+			let leaf = o.key.rsplit('/').find(|s| !s.is_empty()).unwrap_or("");
+			if manifest::is_manifest_key(leaf) || leaf == crypto::VAULT_KEY {
+				continue;
+			}
+			let rel = o.key.strip_prefix(&parent).unwrap_or(&o.key).to_string();
+			out.push((o.key, rel, o.size));
+		}
+		return Ok(out);
+	};
+
+	// E2EE: descend the tree, resolving names + plaintext sizes per manifest.
+	// The folder's own real name seeds the relative path.
+	let root = format!("{}/", item.key.trim_end_matches('/'));
+	let mut stack: Vec<(String, String)> = vec![(root, item.name.clone())];
+	while let Some((dir, rel_base)) = stack.pop() {
+		let manifest = s.store.load(&backend, keys, &dir).await.unwrap_or_default();
+		for o in backend.list(&dir).await? {
+			let leaf = o.key.trim_end_matches('/').rsplit('/').next().unwrap_or("");
+			if manifest::is_manifest_key(leaf) || leaf == crypto::VAULT_KEY {
+				continue;
+			}
+			if o.is_prefix {
+				let sub = manifest.name_for(leaf).unwrap_or(leaf).to_string();
+				stack.push((format!("{dir}{leaf}/"), format!("{rel_base}/{sub}")));
+			} else {
+				let name = manifest.name_for(leaf).unwrap_or(leaf).to_string();
+				let plaintext = manifest
+					.files
+					.get(leaf)
+					.map(|f| f.size)
+					.unwrap_or_else(|| plaintext_of_ciphertext(o.size)); // orphan fallback
+				out.push((o.key, format!("{rel_base}/{name}"), plaintext));
+			}
+		}
+	}
+	Ok(out)
+}
+
 fn path_to_key(rel: &std::path::Path) -> String {
 	rel
 		.components()
@@ -1373,27 +1426,13 @@ async fn run_download(
 	let mut targets: Vec<(String, String, u64)> = Vec::new();
 	for item in &items {
 		if item.is_dir {
-			let mut listing = s.backend().await.list_recursive(&item.key).await;
-			if listing.is_err() {
+			let mut res = expand_folder(&s, item).await;
+			if res.is_err() {
 				s.wait_until_healthy(&precancel).await;
-				listing = s.backend().await.list_recursive(&item.key).await;
+				res = expand_folder(&s, item).await; // heal + retry once
 			}
-			match listing {
-				Ok(objs) => {
-					let parent = parent_prefix(&item.key);
-					for o in objs {
-						if o.key.ends_with('/') {
-							continue;
-						}
-						let leaf = o.key.rsplit('/').find(|s| !s.is_empty()).unwrap_or("");
-						if manifest::is_manifest_key(leaf) {
-							continue;
-						}
-						let rel_raw = o.key.strip_prefix(&parent).unwrap_or(&o.key).to_string();
-						let rel = display_rel(&s, &rel_raw);
-						targets.push((o.key, rel, o.size));
-					}
-				}
+			match res {
+				Ok(t) => targets.extend(t),
 				Err(e) => {
 					let _ = ev
 						.send(Event::Toast(format!("Listing {} failed: {e:#}", item.name)))
@@ -1693,13 +1732,6 @@ fn parent_prefix(prefix: &str) -> String {
 	match trimmed.rfind('/') {
 		Some(i) => trimmed[..=i].to_string(),
 		None => String::new(),
-	}
-}
-
-fn display_rel(s: &Session, raw_rel: &str) -> String {
-	match s.keys.as_deref() {
-		Some(k) => crypto::decrypt_path(k, raw_rel).unwrap_or_else(|_| raw_rel.to_string()),
-		None => raw_rel.to_string(),
 	}
 }
 
