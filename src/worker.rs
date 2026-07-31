@@ -234,28 +234,15 @@ impl Session {
 		)
 	}
 
-	/// Called between retries.
-	async fn wait_until_healthy(&self, cancel: &CancellationToken) {
-		let check = |b: Arc<dyn StorageBackend>| async move {
-			tokio::time::timeout(Duration::from_secs(10), b.health_check())
-				.await
-				.map(|r| r.is_ok())
-				.unwrap_or(false)
-		};
-		if check(self.backend().await).await {
-			return;
-		}
-
+	/// Rebuild the backend connection, serialized so only one task reconnects
+	/// while the rest wait on the same rebuild.
+	async fn rebuild(&self, cancel: &CancellationToken, reason: &str) {
 		let generation = self.conn.generation.load(Ordering::Relaxed);
 		let _guard = self.conn.reconnect.lock().await;
 		if self.conn.generation.load(Ordering::Relaxed) != generation {
 			return; // another task already reconnected while we waited
 		}
-		let _ = self
-			.conn
-			.ev
-			.send(Event::Toast("Connection lost - reconnecting...".into()))
-			.await;
+		let _ = self.conn.ev.send(Event::Toast(reason.into())).await;
 
 		loop {
 			if cancel.is_cancelled() {
@@ -276,6 +263,33 @@ impl Session {
 				}
 			}
 		}
+	}
+
+	/// Called between retries. Cheap probe first: reconnect only if it fails,
+	/// so a live connection is reused as-is.
+	async fn wait_until_healthy(&self, cancel: &CancellationToken) {
+		let healthy = tokio::time::timeout(Duration::from_secs(10), async {
+			self.backend().await.health_check().await
+		})
+		.await
+		.map(|r| r.is_ok())
+		.unwrap_or(false);
+		if healthy {
+			return;
+		}
+		self
+			.rebuild(cancel, "Connection lost - reconnecting...")
+			.await;
+	}
+
+	/// Force a fresh connection even when a health probe would pass. A stalled
+	/// transfer can sit on a connection whose control path still answers
+	/// metadata requests while the data path is wedged; only a rebuild clears
+	/// it. Used once a stall has recurred.
+	async fn force_reconnect(&self, cancel: &CancellationToken) {
+		self
+			.rebuild(cancel, "Transfer stalled - reconnecting...")
+			.await;
 	}
 }
 
@@ -745,6 +759,12 @@ impl Progress {
 
 	fn done_files(&self) -> u64 {
 		self.uploaded.load(Ordering::Relaxed) + self.downloaded.load(Ordering::Relaxed)
+	}
+
+	/// Bytes transferred so far for one in-flight file, if still active.
+	/// The stall watchdog polls this to tell "slow" from "wedged".
+	fn bytes_for(&self, id: u64) -> Option<u64> {
+		self.active.lock().unwrap().get(&id).map(|t| t.done)
 	}
 
 	fn file_start(&self, id: u64, kind: TransferKind, name: &str, total: u64) {
@@ -1270,12 +1290,13 @@ async fn upload_one(
 	let threshold = st.multipart_threshold_mib * 1024 * 1024;
 
 	let mut attempt = 0u32;
+	let mut stalls = 0u32;
 	loop {
 		if cancel.is_cancelled() {
 			return Err(anyhow!("cancelled"));
 		}
 		progress.file_start(id, TransferKind::Upload, rel, plain_len);
-		let result = async {
+		let op = async {
 			let backend = s.backend().await;
 			backend.prepare_parents(&key).await?;
 			if plain_len <= threshold {
@@ -1283,13 +1304,35 @@ async fn upload_one(
 			} else {
 				upload_multipart(s, &backend, st, path, &key, id, progress, cancel).await
 			}
-		}
-		.await;
+		};
+		let result = if st.stall_timeout_secs == 0 {
+			op.await // watchdog disabled
+		} else {
+			guard_stall(
+				Duration::from_secs(st.stall_timeout_secs),
+				id,
+				plain_len,
+				progress,
+				&s.conn.upload_limiter,
+				op,
+			)
+			.await
+		};
 		match result {
 			Ok(()) => return Ok(()),
-			Err(_) if attempt < st.retries && !cancel.is_cancelled() => {
+			Err(e) if attempt < st.retries && !cancel.is_cancelled() => {
 				attempt += 1;
-				s.wait_until_healthy(cancel).await;
+				if e.downcast_ref::<Stalled>().is_some() {
+					stalls += 1;
+				} else {
+					stalls = 0;
+				}
+				if stalls >= 2 {
+					s.force_reconnect(cancel).await;
+					stalls = 0;
+				} else {
+					s.wait_until_healthy(cancel).await;
+				}
 				tokio::time::sleep(s.reconnect_delay()).await;
 			}
 			Err(e) => return Err(e),
@@ -1499,12 +1542,37 @@ async fn run_download(
 			if !file_cancel.is_cancelled() {
 				let out_path = dest.join(sanitize_rel(&rel));
 				let mut attempt = 0u32;
+				let mut stalls = 0u32;
 				let result = loop {
-					match download_one(&s, &key, id, &rel, size, &out_path, &progress, &file_cancel).await {
+					let op = download_one(&s, &key, id, &rel, size, &out_path, &progress, &file_cancel);
+					let outcome = if st.stall_timeout_secs == 0 {
+						op.await // watchdog disabled
+					} else {
+						guard_stall(
+							Duration::from_secs(st.stall_timeout_secs),
+							id,
+							size,
+							&progress,
+							&s.conn.download_limiter,
+							op,
+						)
+						.await
+					};
+					match outcome {
 						Ok(()) => break Ok(()),
-						Err(_) if attempt < st.retries && !file_cancel.is_cancelled() => {
+						Err(e) if attempt < st.retries && !file_cancel.is_cancelled() => {
 							attempt += 1;
-							s.wait_until_healthy(&file_cancel).await;
+							if e.downcast_ref::<Stalled>().is_some() {
+								stalls += 1;
+							} else {
+								stalls = 0;
+							}
+							if stalls >= 2 {
+								s.force_reconnect(&file_cancel).await;
+								stalls = 0;
+							} else {
+								s.wait_until_healthy(&file_cancel).await;
+							}
 							tokio::time::sleep(Duration::from_millis(400 * (1 << attempt.min(4)))).await;
 						}
 						Err(e) => break Err(e),
@@ -1536,6 +1604,74 @@ async fn read_or_stall<T>(fut: impl std::future::Future<Output = std::io::Result
 		.await
 		.map_err(|_| anyhow!("download stalled - connection appears dead"))?
 		.map_err(Into::into)
+}
+
+#[derive(Debug)]
+struct Stalled(u64);
+
+impl std::fmt::Display for Stalled {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		write!(f, "transfer stalled - no progress for {}s", self.0)
+	}
+}
+impl std::error::Error for Stalled {}
+
+/// Run `op`, aborting it if file `id` moves no bytes for `idle`. Dropping `op`
+/// tears down the in-flight socket/handle - that is what actually clears a
+/// wedged write, since cooperative cancellation can't interrupt an `await` that
+/// never yields back to check a token. The stall surfaces as a `Stalled` error
+/// the retry/reconnect path acts on.
+///
+/// Two things are deliberately *not* treated as stalls:
+///   * Rate limiting - when a cap is set, a paced transfer can hold the same
+///     byte count across a poll, so the idle budget is widened, not tripped.
+///   * Finalize phases - once every byte is on the wire (`done >= total`), a
+///     completion/flush step (e.g. multipart complete, server fsync) that moves
+///     nothing must not be killed.
+async fn guard_stall<T>(
+	idle: Duration,
+	id: u64,
+	total: u64,
+	progress: &Progress,
+	limiter: &RateLimiter,
+	op: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+	let idle = idle.max(Duration::from_secs(5));
+	let poll = (idle / 4).max(Duration::from_secs(1));
+	tokio::pin!(op);
+	let mut seen = progress.bytes_for(id).unwrap_or(0);
+	let mut idle_since: Option<Instant> = None;
+	loop {
+		tokio::select! {
+			biased;
+			res = &mut op => return res,
+			_ = tokio::time::sleep(poll) => {
+				let now = progress.bytes_for(id).unwrap_or(seen);
+				// All bytes sent: we're in a finalize/flush phase that
+				// legitimately moves nothing. Don't fire.
+				if total > 0 && now >= total {
+					seen = now;
+					idle_since = None;
+					continue;
+				}
+				if now != seen {
+					seen = now;
+					idle_since = None; // progress: re-arm
+					continue;
+				}
+				// No bytes moved. Under a cap, allow a longer grace before
+				// calling it a stall; unthrottled, "no bytes" is unambiguous.
+				let budget = if limiter.is_unlimited() { idle } else { idle * 4 };
+				match idle_since {
+					None => idle_since = Some(Instant::now()),
+					Some(t) if t.elapsed() >= budget => {
+						return Err(anyhow::Error::new(Stalled(budget.as_secs())));
+					}
+					_ => {}
+				}
+			}
+		}
+	}
 }
 
 fn part_path(out_path: &std::path::Path) -> PathBuf {

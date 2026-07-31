@@ -53,6 +53,13 @@ pub fn present(
 		600.0,
 		current.reconnect_interval_secs as f64,
 	);
+	let stall = spin_row(
+		"Stall timeout (seconds)",
+		"Abort and retry a transfer that stops moving data. 0 = never",
+		0.0,
+		600.0,
+		current.stall_timeout_secs as f64,
+	);
 	let flush = spin_row(
 		"Manifest flush interval (seconds)",
 		"How often encrypted directory metadata is saved back",
@@ -66,6 +73,7 @@ pub fn present(
 	transfers.add(&ul_limit);
 	transfers.add(&retries);
 	transfers.add(&reconnect);
+	transfers.add(&stall);
 	transfers.add(&flush);
 
 	let large = adw::PreferencesGroup::builder()
@@ -106,6 +114,7 @@ pub fn present(
 			multipart_threshold_mib: threshold.value() as u64,
 			part_size_mib: part.value() as u64,
 			reconnect_interval_secs: reconnect.value() as u64,
+			stall_timeout_secs: stall.value() as u64,
 			manifest_flush_secs: flush.value() as u64,
 		});
 	});

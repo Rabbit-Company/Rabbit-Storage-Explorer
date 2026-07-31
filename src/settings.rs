@@ -34,6 +34,11 @@ pub struct Settings {
 	/// drops (seconds). A short value resumes transfers quickly once the
 	/// network returns.
 	pub reconnect_interval_secs: u64,
+	/// Abort and retry a transfer that moves no bytes for this many seconds.
+	/// Catches a connection that is silently wedged mid-transfer while its
+	/// control path still answers (so it is separate from reconnect
+	/// detection). Applies to every backend, uploads and downloads.
+	pub stall_timeout_secs: u64,
 	/// How often buffered `.rse` directory manifests are written back, in
 	/// seconds. Lower = fresher metadata but more requests; higher = cheaper.
 	pub manifest_flush_secs: u64,
@@ -50,6 +55,7 @@ impl Default for Settings {
 			part_size_mib: 16,
 			retries: 500_000,
 			reconnect_interval_secs: 3,
+			stall_timeout_secs: 45,
 			manifest_flush_secs: 10,
 		}
 	}
