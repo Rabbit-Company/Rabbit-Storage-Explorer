@@ -40,7 +40,9 @@ pub fn build(app: &adw::Application) {
 	let stack = gtk::Stack::new();
 	stack.set_transition_type(gtk::StackTransitionType::Crossfade);
 
-	let connection = ConnectionPage::new(cmd.clone(), &window);
+	let toasts = adw::ToastOverlay::new();
+
+	let connection = ConnectionPage::new(cmd.clone(), &window, &toasts);
 	let browser = BrowserPage::new(cmd.clone(), &window);
 	stack.add_named(&connection.root, Some("connect"));
 	stack.add_named(&browser.root, Some("browser"));
@@ -49,7 +51,6 @@ pub fn build(app: &adw::Application) {
 	toolbar_view.add_top_bar(&header);
 	toolbar_view.set_content(Some(&stack));
 
-	let toasts = adw::ToastOverlay::new();
 	toasts.set_child(Some(&toolbar_view));
 	window.set_content(Some(&toasts));
 

@@ -16,6 +16,7 @@ pub struct ConnectionPage {
 	pub root: gtk::Widget,
 	cmd: async_channel::Sender<Command>,
 	window: glib::WeakRef<adw::ApplicationWindow>,
+	toasts: adw::ToastOverlay,
 
 	stack: gtk::Stack,
 	profiles_list: gtk::ListBox,
@@ -57,7 +58,11 @@ pub struct ConnectionPage {
 }
 
 impl ConnectionPage {
-	pub fn new(cmd: async_channel::Sender<Command>, window: &adw::ApplicationWindow) -> Rc<Self> {
+	pub fn new(
+		cmd: async_channel::Sender<Command>,
+		window: &adw::ApplicationWindow,
+		toasts: &adw::ToastOverlay,
+	) -> Rc<Self> {
 		// Header and the action button stay pinned; only the connection list
 		// in the middle scrolls when the window is small.
 		let list_title = gtk::Label::new(Some("Connections"));
@@ -285,6 +290,7 @@ impl ConnectionPage {
 			root,
 			cmd,
 			window: weak_window,
+			toasts: toasts.clone(),
 			stack,
 			profiles_list,
 			list_empty_note,
@@ -337,6 +343,10 @@ impl ConnectionPage {
 
 		page.reset();
 		page
+	}
+
+	fn toast(&self, msg: &str) {
+		self.toasts.add_toast(adw::Toast::new(msg));
 	}
 
 	fn selected_kind(&self) -> BackendKind {
@@ -689,7 +699,9 @@ impl ConnectionPage {
 			}
 			ConnectionProfile::upsert(&profile);
 			if let Err(e) = settings::store_secret(&profile.name, &secret) {
-				eprintln!("keychain unavailable, secret not saved: {e:#}");
+				self.toast(&format!(
+					"Couldn't save the secret to the keychain. You will be asked for it next time ({e})"
+				));
 			}
 		}
 		self.send_connect(profile, secret, password);

@@ -1873,9 +1873,13 @@ fn parent_prefix(prefix: &str) -> String {
 
 /// Prevent path traversal from hostile object keys ("../../etc/passwd").
 fn sanitize_rel(rel: &str) -> PathBuf {
-	rel
-		.split('/')
-		.filter(|s| !s.is_empty() && *s != "." && *s != "..")
+	let normalized = rel.replace('\\', "/");
+	std::path::Path::new(&normalized)
+		.components()
+		.filter_map(|c| match c {
+			std::path::Component::Normal(part) => Some(part),
+			_ => None, // drop RootDir, Prefix (C:\), CurDir (.), ParentDir (..)
+		})
 		.collect()
 }
 
@@ -2262,4 +2266,78 @@ fn plaintext_of_ciphertext(cipher_len: u64) -> u64 {
 	let remainder = body % cipher_chunk; // last (possibly partial) chunk incl. its tag
 	let chunks = full_chunks + if remainder > 0 { 1 } else { 0 };
 	body.saturating_sub(chunks.max(1) * tag)
+}
+
+#[cfg(test)]
+mod path_safety_tests {
+	use super::*;
+	use std::path::{Component, Path, PathBuf};
+
+	fn escapes(dest: &Path, rel: &str) -> bool {
+		let joined = dest.join(sanitize_rel(rel));
+		if !joined.starts_with(dest) {
+			return true;
+		}
+		joined
+			.strip_prefix(dest)
+			.unwrap()
+			.components()
+			.any(|c| !matches!(c, Component::Normal(_)))
+	}
+
+	#[test]
+	fn normal_paths_are_preserved() {
+		let dest = PathBuf::from("/tmp/dl");
+		assert_eq!(
+			dest.join(sanitize_rel("a/b/c.txt")),
+			PathBuf::from("/tmp/dl/a/b/c.txt")
+		);
+		assert_eq!(
+			dest.join(sanitize_rel("file.bin")),
+			PathBuf::from("/tmp/dl/file.bin")
+		);
+	}
+
+	#[test]
+	fn unix_traversal_is_contained() {
+		let dest = PathBuf::from("/tmp/dl");
+		for rel in [
+			"../../etc/passwd",
+			"..",
+			"../",
+			"a/../../../b",
+			"/etc/passwd",
+			"//etc//passwd",
+			"./../../secret",
+			"a/./b/../c",
+			"....//....//x", // '....' is a literal name, not traversal
+		] {
+			assert!(!escapes(&dest, rel), "escaped with rel = {rel:?}");
+		}
+	}
+
+	#[test]
+	fn windows_traversal_is_contained() {
+		let dest = PathBuf::from("/tmp/dl");
+		for rel in ["..\\..\\Windows\\System32", "a\\..\\..\\b", "C:\\evil"] {
+			assert!(!escapes(&dest, rel), "escaped with rel = {rel:?}");
+		}
+	}
+
+	#[test]
+	fn absolute_is_made_relative() {
+		let dest = PathBuf::from("/tmp/dl");
+		assert_eq!(
+			dest.join(sanitize_rel("/etc/passwd")),
+			PathBuf::from("/tmp/dl/etc/passwd")
+		);
+	}
+
+	#[test]
+	fn pure_traversal_collapses_to_dest() {
+		// "../.." -> empty -> join yields dest itself (a directory); the file
+		// open then fails safely rather than writing anywhere outside.
+		let dest = PathBuf::from("/tmp/dl");
+		assert_eq!(dest.join(sanitize_rel("../..")), dest);
+	}
 }

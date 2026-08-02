@@ -51,7 +51,7 @@ impl Default for Settings {
 			download_parallelism: 6,
 			max_download_mbps: 0,
 			max_upload_mbps: 0,
-			multipart_threshold_mib: 64,
+			multipart_threshold_mib: 16,
 			part_size_mib: 16,
 			retries: 500_000,
 			reconnect_interval_secs: 3,
